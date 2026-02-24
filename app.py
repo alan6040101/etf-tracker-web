@@ -4,7 +4,7 @@ import numpy as np
 import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 import os
 import re
 import glob
@@ -16,12 +16,19 @@ import warnings
 st.set_page_config(page_title="00981a 戰情室", layout="wide")
 warnings.filterwarnings("ignore")
 
-# ---------------- 0. 資料處理核心函式 ----------------
+# ---------------- 0. 核心工具函式 ----------------
 
 def extract_date_from_filename(filename):
-    digits = re.sub(r'\D', '', filename)
-    match8 = re.search(r'20\d{6}', digits)
-    if match8: return match8.group(0)
+    """從檔名提取日期 (支援 20240101 或 1130101 格式)"""
+    digits = re.sub(r'\D', '', os.path.basename(filename))
+    # 找 202xxxxx
+    match8 = re.search(r'(20\d{6})', digits)
+    if match8: return match8.group(1)
+    # 找 11xxxxx (民國年)
+    match7 = re.search(r'(1\d{2})(\d{2})(\d{2})', digits)
+    if match7:
+        year = int(match7.group(1)) + 1911
+        return f"{year}{match7.group(2)}{match7.group(3)}"
     return None
 
 def clean_number(val):
@@ -32,35 +39,24 @@ def clean_number(val):
     except:
         return 0.0
 
-def format_money_label(val):
-    if val is None or pd.isna(val): return "0"
-    abs_val = abs(val)
-    if abs_val >= 100000000:
-        return f"{val/100000000:,.2f}億"
-    elif abs_val >= 10000:
-        return f"{val/10000:,.2f}萬"
-    return f"{int(round(val)):,}"
-
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=600)
 def sync_00981a_data():
-    """只同步 00981a 的資料"""
+    """從 GitHub 同步資料 (增加錯誤處理)"""
     repo_url = "https://github.com/alan6040101/00981a-data.git"
     dir_name = "data_00981a"
     
-    # 嘗試刪除舊資料，如果失敗(權限問題)則忽略，直接用 git pull 更新
+    # 移除舊資料夾 (忽略錯誤)
     if os.path.exists(dir_name):
-        try:
-            shutil.rmtree(dir_name)
+        try: shutil.rmtree(dir_name)
         except: pass
     
+    # 重新 Clone
     try:
+        subprocess.run(["git", "clone", repo_url, dir_name, "-q"], check=True)
+    except subprocess.CalledProcessError:
+        # 如果 Clone 失敗，但資料夾存在，嘗試用既有的
         if not os.path.exists(dir_name):
-            subprocess.run(["git", "clone", repo_url, dir_name, "-q"], check=True)
-        else:
-            # 如果資料夾存在，嘗試 pull
-            subprocess.run(["git", "-C", dir_name, "pull", "-q"], check=False)
-    except:
-        pass # 忽略錯誤，嘗試讀取現有檔案
+            return pd.DataFrame()
 
     files = glob.glob(f"{dir_name}/**/*.xlsx", recursive=True)
     local_list = []
@@ -72,86 +68,84 @@ def sync_00981a_data():
     
     df = pd.DataFrame(local_list)
     if not df.empty:
-        # 確保日期排序正確
         df = df.sort_values('date', ascending=False).reset_index(drop=True)
     return df
 
 def read_excel_holdings(path):
-    """讀取單一 Excel 檔案並標準化欄位 - 增強版"""
+    """讀取 Excel (增強版: 暴力搜尋表頭)"""
     try:
-        # 先讀前幾行找 Header
-        df_raw = pd.read_excel(path, header=None, nrows=20)
-    except Exception as e:
-        return pd.DataFrame()
-
-    target_header_idx = -1
-    # 尋找包含關鍵字的列作為 Header
-    for idx, row in df_raw.iterrows():
-        row_str = "".join([str(x) for x in row.fillna("")])
-        # 寬鬆匹配：只要有 '名稱' 和 ('股數' 或 'Shares' 或 '單位數')
-        if ('名稱' in row_str or 'Name' in row_str) and \
-           ('股數' in row_str or 'Shares' in row_str or '單位數' in row_str or 'Units' in row_str):
-            target_header_idx = idx
-            break
-    
-    if target_header_idx == -1:
-        # 如果找不到，嘗試預設第一行
-        target_header_idx = 0
-
-    try:
-        df = pd.read_excel(path, header=target_header_idx)
+        # 先讀前 30 行，不設 Header
+        df_raw = pd.read_excel(path, header=None, nrows=30)
     except:
         return pd.DataFrame()
 
-    df = df.dropna(how='all', axis=1)
+    target_idx = -1
+    # 尋找含有關鍵字的列
+    for idx, row in df_raw.iterrows():
+        row_str = "".join([str(x) for x in row.fillna("")])
+        # 只要同一行出現 '名稱' 且出現 '股數'/'單位數'/'Shares' 就算找到
+        if ('名稱' in row_str or 'Name' in row_str) and \
+           ('股數' in row_str or 'Shares' in row_str or '單位數' in row_str):
+            target_idx = idx
+            break
     
-    # 建立欄位對應字典
-    col_map = {}
-    for c in df.columns:
-        c_str = str(c).strip()
-        if any(x in c_str for x in ['代號', 'Code', 'ID']): col_map[c] = 'ID'
-        elif any(x in c_str for x in ['名稱', 'Name', 'Security']): col_map[c] = 'Name'
-        elif any(x in c_str for x in ['股數', 'Shares', 'Units', '單位數']): col_map[c] = 'Shares'
-        elif any(x in c_str for x in ['權重', 'Weight', '%']): col_map[c] = 'Weight'
-    
-    df = df.rename(columns=col_map)
-    
-    # 檢查必要欄位
-    if 'ID' not in df.columns or 'Shares' not in df.columns:
+    if target_idx == -1: return pd.DataFrame() # 找不到表頭
+
+    try:
+        # 重新讀取正確的 Header
+        df = pd.read_excel(path, header=target_idx)
+        df = df.dropna(how='all', axis=1) # 移除全空欄
+        
+        # 欄位對應
+        col_map = {}
+        for c in df.columns:
+            c_str = str(c).strip()
+            if any(x in c_str for x in ['代號', 'Code', 'ID']): col_map[c] = 'ID'
+            elif any(x in c_str for x in ['名稱', 'Name', 'Security']): col_map[c] = 'Name'
+            elif any(x in c_str for x in ['股數', 'Shares', 'Units', '單位數']): col_map[c] = 'Shares'
+            elif any(x in c_str for x in ['權重', 'Weight', '%']): col_map[c] = 'Weight'
+        
+        df = df.rename(columns=col_map)
+        
+        # 檢查必要欄位
+        if 'ID' not in df.columns or 'Shares' not in df.columns:
+            return pd.DataFrame()
+            
+        # 清理資料
+        df['ID'] = df['ID'].astype(str).str.replace(r'\.TW|\.TWO', '', regex=True).str.strip()
+        df['Shares'] = df['Shares'].apply(clean_number)
+        
+        if 'Weight' in df.columns:
+            df['Weight_Val'] = df['Weight'].apply(clean_number)
+        else:
+            df['Weight_Val'] = 0.0
+            
+        if 'Name' not in df.columns: df['Name'] = df['ID']
+
+        return df[['ID', 'Name', 'Shares', 'Weight_Val']]
+        
+    except Exception:
         return pd.DataFrame()
 
-    # 資料清理
-    df['ID'] = df['ID'].astype(str).str.replace(r'\.TW|\.TWO', '', regex=True).str.strip()
-    # 處理股數：轉為數值，若失敗設為0
-    df['Shares'] = df['Shares'].apply(lambda x: clean_number(x))
-    
-    if 'Weight' in df.columns:
-        df['Weight_Val'] = df['Weight'].apply(lambda x: clean_number(x))
-    else:
-        df['Weight_Val'] = 0.0
-        
-    if 'Name' not in df.columns:
-        df['Name'] = df['ID']
-
-    return df[['ID', 'Name', 'Shares', 'Weight_Val']]
-
 @st.cache_data(ttl=3600)
-def get_all_stocks_history(all_sids):
-    """一次下載歷史股價"""
-    if not all_sids: return pd.DataFrame()
-    tickers = [f"{sid}.TW" for sid in all_sids]
-    # 下載較長區間以確保有足夠資料計算成本
+def get_stock_price_robust(ticker_list, period="1y"):
+    """穩健的股價下載函式 (處理 Streamlit Cloud 問題)"""
+    if not ticker_list: return pd.DataFrame()
+    
     try:
-        data = yf.download(tickers, period="1y", group_by='ticker', auto_adjust=True, threads=True, progress=False)
+        # threads=False 在 Streamlit Cloud 比較穩定
+        data = yf.download(ticker_list, period=period, group_by='ticker', 
+                          auto_adjust=True, threads=False, progress=False)
         return data
     except:
         return pd.DataFrame()
 
 def calculate_cost_line(history_files, target_sid, price_df):
-    """計算特定股票的移動平均成本線"""
-    # 必須按照時間 舊 -> 新 排序
+    """計算成本線邏輯"""
+    # 確保按日期 舊 -> 新
     sorted_files = history_files.sort_values('date', ascending=True)
     
+    # 建立持股時間序列
     records = []
     for _, row in sorted_files.iterrows():
         df_h = read_excel_holdings(row['path'])
@@ -164,14 +158,10 @@ def calculate_cost_line(history_files, target_sid, price_df):
     
     df_holdings = pd.DataFrame(records).set_index('Date')
     
-    if price_df.empty: 
-        return [], [], [], []
+    if price_df.empty: return [], [], [], []
     
-    # 確保 Index 為 Datetime
+    # 對齊
     price_df.index = pd.to_datetime(price_df.index)
-    
-    # 合併持股與股價 (對齊日期)
-    # 使用 reindex 對齊到股價的交易日
     aligned_shares = df_holdings.reindex(price_df.index, method='ffill').fillna(0)['Shares']
     aligned_diff = aligned_shares.diff().fillna(0)
     
@@ -181,32 +171,25 @@ def calculate_cost_line(history_files, target_sid, price_df):
     costs = []
     avg_cost = 0.0
     total_cost = 0.0
-    current_shares = 0
+    curr_shares = 0
     
-    for price, share, diff in zip(closes, aligned_shares, aligned_diff):
-        if share <= 10: # 視為清空
-            avg_cost = 0
-            total_cost = 0
-            costs.append(None)
-            current_shares = 0
+    for p, s, d in zip(closes, aligned_shares, aligned_diff):
+        if s <= 10: # 持股歸零
+            avg_cost = 0; total_cost = 0; costs.append(None)
+            curr_shares = 0
         else:
-            if current_shares <= 10: # 重新建倉
-                avg_cost = price
-                total_cost = share * price
+            if curr_shares <= 10: # 新建倉
+                avg_cost = p; total_cost = s * p
             else:
-                if diff > 0: # 買進，更新成本
-                    total_cost += diff * price
-                elif diff < 0: # 賣出，成本不變，總成本減少
-                    total_cost += diff * avg_cost 
+                if d > 0: total_cost += d * p # 買進
+                elif d < 0: total_cost += d * avg_cost # 賣出
             
-            if share > 0:
-                avg_cost = total_cost / share
-            else:
-                avg_cost = 0
-                
+            if s > 0: avg_cost = total_cost / s
+            else: avg_cost = 0
+            
             costs.append(avg_cost)
-            current_shares = share
-
+            curr_shares = s
+            
     return costs, dates, aligned_shares, aligned_diff
 
 # ---------------- 功能 1: 總覽 ----------------
@@ -215,192 +198,181 @@ def render_overview(file_list):
     st.header("📈 00981a 總覽")
     
     if file_list.empty:
-        st.error("無資料檔案")
+        st.error("❌ 無法找到任何資料檔案。請檢查 GitHub 連結是否正確，或檔案是否為 .xlsx 格式。")
         return
 
     col1, col2 = st.columns([2, 1])
     
-    # 1. 00981a 股價圖
+    # --- 1. ETF 股價圖 (含 fallback 機制) ---
     with col1:
-        st.subheader("00981.TW 近一年走勢")
-        try:
-            # 使用明確的代號 .TW
-            etf_ticker = "00981.TW" 
-            etf_price = yf.download(etf_ticker, period="1y", interval="1d", progress=False, auto_adjust=True)
+        st.subheader("00981a 近一年走勢")
+        
+        # 優先嘗試使用者指定的代號
+        target_ticker = "00981A.TW"
+        etf_price = get_stock_price_robust([target_ticker])
+        
+        # 如果抓不到，嘗試標準代號 00981.TW (備援)
+        if etf_price.empty:
+            # st.warning(f"⚠️ 無法取得 {target_ticker} 資料，嘗試使用 00981.TW...")
+            target_ticker = "00981.TW"
+            etf_price = get_stock_price_robust([target_ticker])
+        
+        if not etf_price.empty:
+            # 處理 MultiIndex (如果只有一個 ticker，可能是單層或多層)
+            p_df = etf_price
+            if isinstance(etf_price.columns, pd.MultiIndex):
+                if target_ticker in etf_price.columns.levels[0]:
+                    p_df = etf_price[target_ticker]
             
-            if not etf_price.empty:
-                # 處理 MultiIndex Column 的情況 (yfinance 新版)
-                if isinstance(etf_price.columns, pd.MultiIndex):
-                    try:
-                        etf_price = etf_price.xs(etf_ticker, axis=1, level=0)
-                    except: pass # 如果失敗可能結構不同，直接用
+            fig = go.Figure(data=[go.Candlestick(x=p_df.index,
+                            open=p_df['Open'], high=p_df['High'],
+                            low=p_df['Low'], close=p_df['Close'])])
+            fig.update_layout(height=400, xaxis_rangeslider_visible=False, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.error(f"❌ 無法取得 ETF 股價 (已嘗試 00981A.TW 與 00981.TW)。請稍後再試。")
 
-                fig = go.Figure(data=[go.Candlestick(x=etf_price.index,
-                                open=etf_price['Open'], high=etf_price['High'],
-                                low=etf_price['Low'], close=etf_price['Close'])])
-                fig.update_layout(height=400, xaxis_rangeslider_visible=False, template="plotly_white", margin=dict(l=20, r=20, t=20, b=20))
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.warning("無法從 Yahoo Finance 取得 00981.TW 數據，請稍後再試。")
-        except Exception as e:
-            st.error(f"股價讀取錯誤: {e}")
-
-    # 2. 讀取最新持股
+    # --- 2. 讀取最新持股 ---
     latest_file = file_list.iloc[0]
     st.write(f"📅 最新持股日期: **{latest_file['date']}**")
     
     df_holdings = read_excel_holdings(latest_file['path'])
     
     if df_holdings.empty:
-        st.error("⚠️ 無法讀取 Excel 持股資料，請檢查 GitHub 來源檔案格式。")
+        st.error(f"❌ 無法解析檔案: {os.path.basename(latest_file['path'])}。請檢查 Excel 內容是否包含 [代號, 名稱, 股數] 等欄位。")
+        # 列出一些除錯資訊
+        try:
+            raw = pd.read_excel(latest_file['path'], nrows=5)
+            st.write("檔案前 5 行內容 (用於除錯):", raw)
+        except: pass
         return
 
-    # 3. 準備表格資料與計算成本
-    with st.spinner("正在取得成分股即時報價與計算成本..."):
+    # --- 3. 計算成分股 ---
+    with st.spinner("計算成分股成本與現價中..."):
         sids = df_holdings['ID'].tolist()
+        tickers = [f"{s}.TW" for s in sids]
         
-        # 取得歷史資料用於計算成本
-        all_hist_price = get_all_stocks_history(sids)
+        # 一次下載所有歷史
+        all_hist = get_stock_price_robust(tickers)
         
-        # 取得最新股價 (取歷史資料的最後一筆)
-        current_prices = {}
+        curr_price_map = {}
         cost_map = {}
         
         for sid in sids:
-            ticker = f"{sid}.TW"
+            t = f"{sid}.TW"
+            p_df = pd.DataFrame()
+            
+            # 提取個股 DataFrame
             try:
-                # 提取個股歷史
-                if isinstance(all_hist_price.columns, pd.MultiIndex):
-                    if ticker in all_hist_price.columns.levels[0]:
-                        p_df = all_hist_price[ticker]
+                if not all_hist.empty:
+                    if isinstance(all_hist.columns, pd.MultiIndex):
+                        if t in all_hist.columns.levels[0]:
+                            p_df = all_hist[t]
                     else:
-                        p_df = pd.DataFrame()
-                else:
-                    p_df = all_hist_price # 只有一檔時
-                
-                if not p_df.empty:
-                    # 1. 紀錄現價
-                    current_prices[sid] = p_df['Close'].iloc[-1]
-                    
-                    # 2. 計算成本
-                    c_line, _, _, _ = calculate_cost_line(file_list, sid, p_df)
-                    # 取最後一個非 None 的成本
-                    valid_costs = [c for c in c_line if c is not None]
-                    cost_map[sid] = valid_costs[-1] if valid_costs else 0
-                else:
-                    current_prices[sid] = 0
-                    cost_map[sid] = 0
-            except:
-                current_prices[sid] = 0
+                        # 只有一檔股票時
+                        p_df = all_hist
+            except: pass
+            
+            if not p_df.empty:
+                # 現價
+                curr_price_map[sid] = p_df['Close'].iloc[-1]
+                # 成本
+                c_line, _, _, _ = calculate_cost_line(file_list, sid, p_df)
+                valid = [x for x in c_line if x is not None]
+                cost_map[sid] = valid[-1] if valid else 0
+            else:
+                curr_price_map[sid] = 0
                 cost_map[sid] = 0
 
-    # 整合資料
-    df_holdings['現價'] = df_holdings['ID'].map(current_prices)
+    df_holdings['現價'] = df_holdings['ID'].map(curr_price_map)
     df_holdings['估算成本'] = df_holdings['ID'].map(cost_map)
+    
+    # 避免除以零
+    df_holdings['損益率(%)'] = df_holdings.apply(
+        lambda x: ((x['現價'] - x['估算成本'])/x['估算成本']*100) if x['估算成本'] > 0 else 0, 
+        axis=1
+    )
     df_holdings['市值'] = df_holdings['Shares'] * df_holdings['現價']
-    
-    # 計算損益
-    def calc_roi(row):
-        if row['估算成本'] > 0:
-            return (row['現價'] - row['估算成本']) / row['估算成本'] * 100
-        return 0.0
-    
-    df_holdings['損益率(%)'] = df_holdings.apply(calc_roi, axis=1)
 
-    # 4. 低於成本表格 (右側)
+    # --- 4. 警示表格 (低於成本) ---
     with col2:
-        below_cost = df_holdings[df_holdings['損益率(%)'] < 0].copy()
-        below_cost = below_cost.sort_values('損益率(%)')
-        
-        st.subheader("⚠️ 股價低於成本警示")
+        st.subheader("⚠️ 股價低於成本")
+        below_cost = df_holdings[df_holdings['損益率(%)'] < 0].sort_values('損益率(%)')
         st.metric("低於成本檔數", f"{len(below_cost)} 檔")
+        
         if not below_cost.empty:
             st.dataframe(
-                below_cost[['代號', '名稱', '現價', '估算成本', '損益率(%)']].style.format({
+                below_cost[['ID', 'Name', '現價', '估算成本', '損益率(%)']].style.format({
                     '現價': '{:.2f}', '估算成本': '{:.2f}', '損益率(%)': '{:.2f}'
-                }).map(lambda x: 'color: green', subset=['損益率(%)']), # 負數顯示綠色
-                hide_index=True, 
-                use_container_width=True
+                }).applymap(lambda v: 'color: green' if v < 0 else '', subset=['損益率(%)']),
+                hide_index=True, use_container_width=True
             )
         else:
-            st.success("目前無持股低於成本！")
+            st.success("無低於成本個股")
 
-    # 5. 完整持股清單 (下方)
+    # --- 5. 完整清單 ---
     st.subheader("📋 最新完整持股清單")
-    
-    # 排序：依權重
-    df_holdings = df_holdings.sort_values('Weight_Val', ascending=False)
+    df_show = df_holdings.sort_values('Weight_Val', ascending=False)
     
     st.dataframe(
-        df_holdings[['ID', 'Name', 'Shares', 'Weight_Val', '現價', '估算成本', '損益率(%)', '市值']].style.format({
-            "Shares": "{:,.0f}", 
-            "Weight_Val": "{:.2f}", 
-            "現價": "{:.2f}", 
-            "市值": "{:,.0f}",
-            "估算成本": "{:.2f}",
-            "損益率(%)": "{:.2f}"
+        df_show[['ID', 'Name', 'Shares', 'Weight_Val', '現價', '估算成本', '損益率(%)']].style.format({
+            'Shares': '{:,.0f}', 'Weight_Val': '{:.2f}', 
+            '現價': '{:.2f}', '估算成本': '{:.2f}', '損益率(%)': '{:.2f}'
         }).background_gradient(subset=['損益率(%)'], cmap='RdYlGn', vmin=-10, vmax=10),
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "ID": "代號", "Name": "名稱", "Shares": "股數", "Weight_Val": "權重(%)"
-        }
+        use_container_width=True, hide_index=True,
+        column_config={"ID": "代號", "Name": "名稱", "Shares": "股數", "Weight_Val": "權重(%)"}
     )
 
-# ---------------- 功能 2: 每日持倉變化 ----------------
+# ---------------- 功能 2: 每日變化 ----------------
 
 def render_daily_change(file_list):
-    st.header("📅 每日持倉變化分析")
+    st.header("📅 每日持倉變化")
     
-    # 日期選單 (Calendar)
-    col_sel, col_info = st.columns([1, 3])
-    
-    # 取得可用日期列表 (YYYYMMDD 字串)
-    available_dates_str = file_list['date'].tolist()
-    # 轉為 date 物件供 date_input 使用
-    available_dates_obj = [datetime.strptime(d, "%Y%m%d").date() for d in available_dates_str]
-    
-    if not available_dates_obj:
-        st.error("無可用日期資料")
-        return
-        
-    latest_date = available_dates_obj[0]
-    
-    with col_sel:
-        # 預設選擇最新的一天
-        input_date = st.date_input("選擇查詢日期", latest_date)
-        # 轉回字串比對
-        selected_date_str = input_date.strftime("%Y%m%d")
-    
-    if selected_date_str not in available_dates_str:
-        st.warning(f"❌ {selected_date_str} 當日無資料。")
-        st.info("可用日期: " + ", ".join(available_dates_str[:5]) + " ...")
+    if file_list.empty:
+        st.error("無資料可供分析")
         return
 
-    # 邏輯處理
-    idx = available_dates_str.index(selected_date_str)
-    curr_file = file_list.iloc[idx]
-    
-    prev_file = None
-    if idx + 1 < len(file_list):
-        prev_file = file_list.iloc[idx+1]
+    dates_str = file_list['date'].tolist()
+    # 轉換為 date 物件
+    valid_dates = []
+    for d in dates_str:
+        try:
+            valid_dates.append(datetime.strptime(d, "%Y%m%d").date())
+        except: pass
         
+    if not valid_dates:
+        st.error("無法解析檔案日期格式")
+        return
+
+    col_sel, col_info = st.columns([1, 3])
+    with col_sel:
+        pick_date = st.date_input("選擇查詢日期", valid_dates[0])
+        pick_date_str = pick_date.strftime("%Y%m%d")
+    
+    if pick_date_str not in dates_str:
+        st.warning(f"❌ {pick_date_str} 當日無資料")
+        return
+
+    # 找當日與前一日
+    idx = dates_str.index(pick_date_str)
+    curr_file = file_list.iloc[idx]
+    prev_file = file_list.iloc[idx+1] if idx + 1 < len(file_list) else None
+
     with col_info:
         if prev_file:
-            st.info(f"比較區間: **{prev_file['date']}** (前一交易日) ⮕ **{curr_file['date']}** (當日)")
+            st.info(f"比較: {prev_file['date']} ⮕ {curr_file['date']}")
         else:
-            st.warning("這是最早的資料，無法進行比較。")
+            st.warning("這是第一筆資料，無法比較")
             return
 
-    # 讀取 Excel
     df_curr = read_excel_holdings(curr_file['path'])
     df_prev = read_excel_holdings(prev_file['path'])
     
     if df_curr.empty or df_prev.empty:
-        st.error("讀取檔案失敗，可能是格式不符。")
+        st.error("讀取 Excel 失敗")
         return
-    
-    # 合併比較
+
+    # 合併
     merged = pd.merge(df_prev[['ID', 'Name', 'Shares']], 
                       df_curr[['ID', 'Name', 'Shares', 'Weight_Val']], 
                       on='ID', how='outer', suffixes=('_old', '_new'))
@@ -409,123 +381,101 @@ def render_daily_change(file_list):
     merged = merged.fillna(0)
     merged['股數變化'] = merged['Shares_new'] - merged['Shares_old']
     
-    # 下載股價計算金額
-    sids_changed = merged[merged['股數變化'] != 0]['ID'].tolist()
+    # 下載當日股價算金額
+    sids_change = merged[merged['股數變化'] != 0]['ID'].tolist()
     price_map = {}
     
-    if sids_changed:
-        with st.spinner("正在下載變動個股當日股價..."):
-            target_dt = pd.to_datetime(selected_date_str)
-            tickers = [f"{s}.TW" for s in sids_changed]
-            try:
-                data = yf.download(tickers, start=target_dt - timedelta(days=5), end=target_dt + timedelta(days=3), group_by='ticker', auto_adjust=True, progress=False)
-                for sid in sids_changed:
-                    ticker = f"{sid}.TW"
-                    p_df = pd.DataFrame()
+    if sids_change:
+        with st.spinner("下載變動個股資料..."):
+            target_dt = pd.to_datetime(pick_date_str)
+            tickers = [f"{s}.TW" for s in sids_change]
+            # 用較小區間加快速度
+            data = get_stock_price_robust(tickers, period="1mo")
+            
+            for sid in sids_change:
+                t = f"{sid}.TW"
+                p = 0
+                try:
                     if isinstance(data.columns, pd.MultiIndex):
-                        if ticker in data.columns.levels[0]: p_df = data[ticker]
-                    else:
-                        p_df = data
+                        if t in data.columns.levels[0]: df_p = data[t]
+                        else: df_p = pd.DataFrame()
+                    else: df_p = data
                     
-                    p_df = p_df[p_df.index <= target_dt]
-                    if not p_df.empty:
-                        price_map[sid] = p_df['Close'].iloc[-1]
-                    else:
-                        price_map[sid] = 0
-            except: pass
-    
+                    # 找最接近該日的股價
+                    df_p = df_p[df_p.index <= target_dt]
+                    if not df_p.empty: p = df_p['Close'].iloc[-1]
+                except: pass
+                price_map[sid] = p
+                
     merged['當日股價'] = merged['ID'].map(price_map).fillna(0)
     merged['增減金額'] = merged['股數變化'] * merged['當日股價']
     
-    # 篩選變動
-    df_changes = merged[merged['股數變化'] != 0].copy()
+    # 顯示表格
+    changes = merged[merged['股數變化'] != 0].copy().sort_values('Weight_Val', ascending=False)
     
-    # 樣式設定函數
-    def color_change(val):
-        if val > 0: return 'color: red'
-        elif val < 0: return 'color: green'
-        return ''
-
-    st.subheader("📊 增減明細表")
-    if not df_changes.empty:
-        # 排序：權重由大到小
-        df_changes = df_changes.sort_values('Weight_Val', ascending=False)
-        
-        df_show = df_changes[['ID', 'Name', 'Shares_old', 'Shares_new', '股數變化', '增減金額', 'Weight_Val']]
-        
-        st.dataframe(
-            df_show.style.format({
-                'Shares_old': '{:,.0f}', 'Shares_new': '{:,.0f}', 
-                '股數變化': '{:+,.0f}', '增減金額': '{:,.0f}', 'Weight_Val': '{:.2f}'
-            }).map(color_change, subset=['股數變化', '增減金額']),
-            use_container_width=True,
-            column_config={
-                "Shares_old": "前股數", "Shares_new": "今股數", "Weight_Val": "今日權重(%)"
-            }
-        )
-        
-        # --- 個股詳細圖表 ---
-        st.divider()
-        st.subheader("📈 個股變動詳情 (K線 + 成本線)")
-        
-        # 下拉選單
-        selected_stock = st.selectbox(
-            "請選擇一檔變動股票查看詳情:", 
-            df_changes['ID'].tolist(),
-            format_func=lambda x: f"{x} {df_changes[df_changes['ID']==x]['Name'].values[0]}"
-        )
-        
-        if selected_stock:
-            stock_name = df_changes[df_changes['ID']==selected_stock]['Name'].values[0]
+    st.subheader("📊 增減明細")
+    if not changes.empty:
+        def style_change(v):
+            if v > 0: return 'color: red'
+            elif v < 0: return 'color: green'
+            return ''
             
-            with st.spinner(f"正在繪製 {stock_name} 圖表..."):
-                t_sid = f"{selected_stock}.TW"
-                df_price = yf.download(t_sid, period="1y", auto_adjust=True, progress=False)
+        st.dataframe(
+            changes[['ID', 'Name', 'Shares_old', 'Shares_new', '股數變化', '增減金額', 'Weight_Val']].style.format({
+                'Shares_old': '{:,.0f}', 'Shares_new': '{:,.0f}',
+                '股數變化': '{:+,.0f}', '增減金額': '{:,.0f}', 'Weight_Val': '{:.2f}'
+            }).map(style_change, subset=['股數變化', '增減金額']),
+            use_container_width=True,
+            column_config={"Shares_old": "前股數", "Shares_new": "今股數", "Weight_Val": "權重(%)"}
+        )
+        
+        # --- 詳細圖表 ---
+        st.divider()
+        st.subheader("📈 個股詳情")
+        
+        sel_sid = st.selectbox("選擇股票查看", changes['ID'].tolist(), 
+                               format_func=lambda x: f"{x} {changes[changes['ID']==x]['Name'].values[0]}")
+        
+        if sel_sid:
+            with st.spinner(f"繪製 {sel_sid} 圖表中..."):
+                t_sid = f"{sel_sid}.TW"
+                df_hist = get_stock_price_robust([t_sid], period="2y") # 抓長一點算成本
                 
-                # 計算數據
-                cost_vals, dates, shares_vals, diff_vals = calculate_cost_line(file_list, selected_stock, df_price)
+                cost_vals, dates, shares_vals, diff_vals = calculate_cost_line(file_list, sel_sid, df_hist)
                 
                 if not dates.empty:
-                    # 修復 TypeError: 確保 amounts 是純數值序列，沒有 NaN
-                    amounts = (diff_vals * df_price['Close']).fillna(0)
+                    # 修正: 確保 amounts 沒有 NaN
+                    amounts = (diff_vals * df_hist['Close']).fillna(0)
                     
-                    fig = make_subplots(
-                        rows=3, cols=1, shared_xaxes=True, 
-                        vertical_spacing=0.05, row_heights=[0.5, 0.25, 0.25],
-                        subplot_titles=(f"{stock_name} vs 成本", "00981a 持股水位", "每日增減金額")
-                    )
+                    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05,
+                                       row_heights=[0.5, 0.25, 0.25],
+                                       subplot_titles=("股價 vs 成本", "持股水位", "增減金額"))
                     
-                    # 1. K線
-                    fig.add_trace(go.Candlestick(x=dates, open=df_price['Open'], high=df_price['High'],
-                                                low=df_price['Low'], close=df_price['Close'], name="股價"), row=1, col=1)
-                    # 成本線
+                    fig.add_trace(go.Candlestick(x=dates, open=df_hist['Open'], high=df_hist['High'],
+                                                low=df_hist['Low'], close=df_hist['Close'], name="股價"), row=1, col=1)
                     fig.add_trace(go.Scatter(x=dates, y=cost_vals, mode='lines', 
-                                            line=dict(color='orange', width=2, dash='dot'), name="成本線"), row=1, col=1)
+                                            line=dict(color='orange', dash='dot'), name="成本"), row=1, col=1)
                     
-                    # 2. 水位
                     fig.add_trace(go.Scatter(x=dates, y=shares_vals, mode='lines', fill='tozeroy',
-                                            line=dict(color='blue'), name="持股數"), row=2, col=1)
+                                            line=dict(color='blue'), name="持股"), row=2, col=1)
                     
-                    # 3. 金額 (修復顏色判斷錯誤)
-                    # 轉為 list 避免 Series index 問題
-                    amt_list = amounts.tolist()
-                    colors = ['red' if v > 0 else 'green' for v in amt_list]
-                    
-                    fig.add_trace(go.Bar(x=dates, y=amounts, marker_color=colors, name="增減金額"), row=3, col=1)
+                    # 修正顏色
+                    colors = ['red' if x > 0 else 'green' for x in amounts]
+                    fig.add_trace(go.Bar(x=dates, y=amounts, marker_color=colors, name="金額"), row=3, col=1)
                     
                     fig.update_layout(height=800, xaxis_rangeslider_visible=False, showlegend=False, template="plotly_white")
                     
-                    # 顯示最近 6 個月
-                    last_date = dates[-1]
-                    start_date = last_date - timedelta(days=180)
-                    fig.update_xaxes(range=[start_date, last_date], row=3, col=1)
-
+                    # 縮放最近 6 個月
+                    last = dates[-1]
+                    start = last - timedelta(days=180)
+                    fig.update_xaxes(range=[start, last], row=3, col=1)
+                    
                     st.plotly_chart(fig, use_container_width=True)
                 else:
-                    st.warning("無法取得該股價歷史資料，無法繪圖。")
+                    st.warning("無歷史股價資料")
 
     else:
-        st.info("✅ 該日持股無任何變動。")
+        st.info("該日無持股變動")
 
 # ---------------- 主程式 ----------------
 
@@ -533,16 +483,15 @@ def main():
     st.sidebar.title("🚀 00981a 戰情室")
     
     with st.sidebar:
-        st.write("資料同步中...")
+        st.write("🔄 資料同步中...")
         df_files = sync_00981a_data()
         
         if df_files.empty:
-            st.error("⚠️ 無法取得資料，請檢查 GitHub 連結或網際網路。")
+            st.error("無法同步 GitHub 資料，請確認網路或 Repo 權限。")
             return
-        
-        st.success(f"資料已更新 (共 {len(df_files)} 筆)")
-        
-        menu = st.radio("功能選單", ["總覽 (Overview)", "每日持倉變化 (Daily Changes)"])
+            
+        st.success(f"完成！共 {len(df_files)} 份資料")
+        menu = st.radio("選單", ["總覽 (Overview)", "每日持倉變化 (Daily Changes)"])
         st.markdown("---")
 
     if menu == "總覽 (Overview)":
