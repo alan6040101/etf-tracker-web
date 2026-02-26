@@ -16,10 +16,10 @@ import re
 st.set_page_config(page_title="00981a ETF 追蹤戰情室", layout="wide")
 
 # ---------------------------------------------------------
-# 1. 工具函式
+# 1. 工具函式 (資料同步與解析)
 # ---------------------------------------------------------
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600)  # 設定快取 1 小時，避免頻繁 git clone
 def sync_data_repo():
     """同步 GitHub 資料庫"""
     repo_url = "https://github.com/alan6040101/00981a-data.git"
@@ -28,6 +28,7 @@ def sync_data_repo():
     if os.path.exists(dir_name):
         shutil.rmtree(dir_name)
     
+    # 這裡使用 os.system 來執行 git clone，Streamlit cloud 支援 git 指令
     os.system(f"git clone {repo_url} {dir_name} -q")
     
     files = glob.glob(f"{dir_name}/**/*.xlsx", recursive=True)
@@ -37,6 +38,7 @@ def sync_data_repo():
         if os.path.basename(f).startswith("~$"): continue
         digits = re.sub(r'\D', '', os.path.basename(f))
         
+        # 解析日期
         d_str = None
         match8 = re.search(r'20\d{6}', digits)
         if match8: 
@@ -61,18 +63,8 @@ def clean_number(val):
     except:
         return 0.0
 
-def format_money_label(val):
-    """還原原本的金額格式化邏輯"""
-    if val is None: return "0"
-    abs_val = abs(val)
-    if abs_val >= 100000000:
-        return f"{val/100000000:,.2f}億"
-    elif abs_val >= 10000:
-        return f"{val/10000:,.2f}萬"
-    return f"{int(round(val)):,}"
-
 def parse_excel_holding(path):
-    """讀取 Excel，保留原始字串供顯示用"""
+    """讀取單一 Excel 並標準化欄位"""
     try:
         df_raw = pd.read_excel(path, header=None, nrows=30)
     except: return pd.DataFrame()
@@ -113,26 +105,21 @@ def parse_excel_holding(path):
         df['ID'] = df['ID'].astype(str).str.replace(r'\.0|\.TW|\.TWO|\*', '', regex=True).str.strip()
         if 'Name' not in df.columns: df['Name'] = df['ID']
         
-        # 處理股數
         if 'Shares' in df.columns:
-            df['Shares_num'] = df['Shares'].apply(lambda x: clean_number(x))
-        else: df['Shares_num'] = 0.0
+            df['Shares'] = df['Shares'].apply(lambda x: clean_number(x))
+        else: df['Shares'] = 0.0
             
-        # 處理權重 (保留原始字串與數值)
         if 'Weight' in df.columns:
-            df['Weight_num'] = df['Weight'].apply(lambda x: clean_number(x))
-            df['Weight_str'] = df['Weight'].astype(str)
-        else: 
-            df['Weight_num'] = 0.0
-            df['Weight_str'] = ""
+            df['Weight'] = df['Weight'].apply(lambda x: clean_number(x))
+        else: df['Weight'] = 0.0
         
-        return df[['ID', 'Name', 'Shares_num', 'Weight_num', 'Weight_str']]
+        return df[['ID', 'Name', 'Shares', 'Weight']]
     
     return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
 def get_stock_price_history(ticker, start_date):
-    """取得股價歷史"""
+    """取得股價歷史 (含快取)"""
     try:
         df = yf.download(ticker, start=start_date, progress=False, auto_adjust=True)
         if isinstance(df.columns, pd.MultiIndex):
@@ -143,25 +130,30 @@ def get_stock_price_history(ticker, start_date):
 
 def calculate_avg_cost(df_files, target_sid, price_df):
     """計算特定股票的移動平均成本線"""
+    # 1. 抓取該股票在每一天的持股數
     history_data = []
+    # 為了效能，我們不每次都開檔，而是假設 df_files 已經排序
+    # 注意：這裡若檔案很多，逐個開檔會慢，但在 Streamlit 中我們可以接受幾秒的等待
     for _, row in df_files.iterrows():
         df_step = parse_excel_holding(row['path'])
         shares = 0
         if not df_step.empty:
             match = df_step[df_step['ID'] == str(target_sid)]
             if not match.empty:
-                shares = match['Shares_num'].values[0]
+                shares = match['Shares'].values[0]
         history_data.append({'Date': row['date'], 'Shares': shares})
     
     df_h = pd.DataFrame(history_data).sort_values('Date').set_index('Date')
     
-    if price_df.empty: return [], [], [], []
+    # 2. 對齊股價日期
+    if price_df.empty: return [], [], []
     
-    # 合併持股與股價
+    # 合併持股與股價 (以股價交易日為主)
     df_calc = price_df[['Close']].join(df_h, how='left')
     df_calc['Shares'] = df_calc['Shares'].ffill().fillna(0)
     df_calc['Diff'] = df_calc['Shares'].diff().fillna(0)
     
+    # 3. 計算成本
     cost_line = []
     total_cost = 0.0
     avg_cost = 0.0
@@ -176,79 +168,32 @@ def calculate_avg_cost(df_files, target_sid, price_df):
             total_cost = 0.0
             cost_line.append(None)
         else:
+            # 初始建倉 或 加碼
             if total_cost == 0 and avg_cost == 0:
                 avg_cost = p
                 total_cost = s * p
             else:
-                if d > 0: 
+                if d > 0: # 買進，更新成本
                     total_cost += d * p
-                elif d < 0: 
+                elif d < 0: # 賣出，成本單價不變，總成本減少
                     total_cost += d * avg_cost
             
             if s > 0:
                 avg_cost = total_cost / s
             else:
                 avg_cost = 0.0
+            
             cost_line.append(avg_cost)
             
     return df_calc.index, cost_line, shares_series, diff_series
 
-def draw_stock_chart(sid, name, df_files):
-    """繪製標準的三欄式圖表 (K線+成本 / 水位 / 金額)"""
-    chart_start = datetime.now() - timedelta(days=365)
-    df_chart_price = get_stock_price_history(f"{sid}.TW", chart_start)
-    
-    if df_chart_price.empty:
-        st.error(f"無法下載 {sid} {name} 的股價資料")
-        return
-
-    # 計算數據
-    dates, cost_line, shares_series, diff_series = calculate_avg_cost(df_files, sid, df_chart_price)
-    amounts = diff_series * df_chart_price['Close'].values
-
-    # 繪圖
-    fig = make_subplots(
-        rows=3, cols=1, shared_xaxes=True, 
-        row_heights=[0.6, 0.2, 0.2], vertical_spacing=0.05,
-        subplot_titles=("股價 & 981成本線", "持股水位", "每日增減金額")
-    )
-
-    # Row 1: K線 + 成本
-    fig.add_trace(go.Candlestick(
-        x=dates, open=df_chart_price['Open'], high=df_chart_price['High'],
-        low=df_chart_price['Low'], close=df_chart_price['Close'], name='股價'
-    ), row=1, col=1)
-
-    fig.add_trace(go.Scatter(
-        x=dates, y=cost_line, mode='lines', 
-        line=dict(color='orange', width=2, dash='dot'), name='981成本'
-    ), row=1, col=1)
-
-    # Row 2: 持股數
-    fig.add_trace(go.Scatter(
-        x=dates, y=shares_series, mode='lines+markers',
-        fill='tozeroy', line=dict(color='blue'), name='持股數'
-    ), row=2, col=1)
-
-    # Row 3: 增減金額 (紅綠)
-    colors = ['red' if x > 0 else 'green' for x in amounts]
-    # 格式化 tooltip
-    hover_texts = [format_money_label(x) for x in amounts]
-    
-    fig.add_trace(go.Bar(
-        x=dates, y=amounts, marker_color=colors, name='淨買賣額',
-        text=hover_texts
-    ), row=3, col=1)
-
-    fig.update_layout(height=800, xaxis_rangeslider_visible=False, title_text=f"{sid} {name} 持倉分析")
-    st.plotly_chart(fig, use_container_width=True)
-
 # ---------------------------------------------------------
-# 2. 主程式邏輯
+# 2. 頁面邏輯
 # ---------------------------------------------------------
 
 st.title("📊 00981a 追蹤戰情室")
 
+# 下載資料
 with st.spinner('正在同步 GitHub 資料...'):
     df_files = sync_data_repo()
 
@@ -256,6 +201,7 @@ if df_files.empty:
     st.error("找不到資料檔，請確認 GitHub 連結是否正確。")
     st.stop()
 
+# 側邊欄選單
 menu = st.sidebar.radio("功能選單", ["總覽 (Dashboard)", "每日持倉變化"])
 
 latest_date_record = df_files.iloc[-1]['date']
@@ -268,15 +214,14 @@ st.sidebar.info(f"資料庫最新日期: {latest_date_record.strftime('%Y-%m-%d'
 if menu == "總覽 (Dashboard)":
     st.header("📈 00981a 總覽")
     
-    # 1. 00981A ETF 本身走勢 (修正代號為 00981A.TW)
+    # 1. 00981 ETF 本身走勢
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        st.subheader("00981A.TW 近一年走勢")
+        st.subheader("00981.TW 近一年走勢")
         end_d = datetime.now()
         start_d = end_d - timedelta(days=365)
-        # 修正：使用 00981A.TW
-        df_etf = get_stock_price_history("00981A.TW", start_d)
+        df_etf = get_stock_price_history("00981.TW", start_d)
         
         if not df_etf.empty:
             fig = go.Figure(data=[go.Candlestick(
@@ -287,36 +232,42 @@ if menu == "總覽 (Dashboard)":
             fig.update_layout(height=400, margin=dict(l=20, r=20, t=20, b=20))
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.warning("無法取得 00981A.TW 股價資料")
+            st.warning("無法取得 00981.TW 股價資料")
 
+    # 讀取最新持股
     df_latest = parse_excel_holding(latest_path)
     
-    # 2. 潛在雷區分析
+    # 準備計算 "低於成本" 的股票 (這需要一點時間，因為要跑迴圈算成本)
     st.subheader("⚠️ 潛在雷區 (現價 < 981建倉成本)")
     
-    # 用 session state 儲存計算結果，避免重整消失
-    if 'underwater_data' not in st.session_state:
-        st.session_state.underwater_data = None
-
     if st.button("計算持股盈虧分析 (需時較長)"):
         report_data = []
         progress_bar = st.progress(0)
+        
+        # 取得所有成分股代號
         sids = df_latest['ID'].tolist()
+        
+        # 批次下載這一年股價以加速
         tickers = [f"{sid}.TW" for sid in sids]
+        # 為了處理 .TWO，這邊做簡單判斷 (或是直接全部都試)
+        # 簡化起見，先假設都是 .TW，實務上可混合下載
         
         with st.spinner("正在下載成分股股價與計算成本..."):
+            # 下載全部股價 (快取)
             bulk_data = yf.download(tickers, start=start_d, group_by='ticker', progress=False, auto_adjust=True)
             
             for i, row in enumerate(df_latest.itertuples()):
                 sid = row.ID
                 name = row.Name
-                current_shares = row.Shares_num
+                current_shares = row.Shares
                 
+                # 取得該股股價 df
                 try:
                     if len(tickers) > 1:
                         df_p = bulk_data[f"{sid}.TW"]
                     else:
-                        df_p = bulk_data
+                        df_p = bulk_data # 只有一檔時結構不同
+                    
                     df_p = df_p.dropna()
                 except:
                     df_p = pd.DataFrame()
@@ -324,6 +275,7 @@ if menu == "總覽 (Dashboard)":
                 if not df_p.empty:
                     # 計算成本
                     _, cost_line, _, _ = calculate_avg_cost(df_files, sid, df_p)
+                    
                     current_price = df_p['Close'].iloc[-1]
                     current_cost = cost_line[-1] if cost_line and cost_line[-1] is not None else 0
                     
@@ -335,42 +287,31 @@ if menu == "總覽 (Dashboard)":
                                 "名稱": name,
                                 "現價": round(current_price, 2),
                                 "981成本": round(current_cost, 2),
-                                "帳面損益 (%)": round(diff_pct, 2)
+                                "帳面損益 (%)": round(diff_pct, 2),
+                                "目前持股": f"{int(current_shares):,}"
                             })
+                
                 progress_bar.progress((i + 1) / len(df_latest))
         
-        st.session_state.underwater_data = pd.DataFrame(report_data)
+        df_underwater = pd.DataFrame(report_data)
+        if not df_underwater.empty:
+            df_underwater = df_underwater.sort_values("帳面損益 (%)")
+            st.dataframe(
+                df_underwater.style.format({
+                    "現價": "{:.2f}", 
+                    "981成本": "{:.2f}",
+                    "帳面損益 (%)": "{:.2f}%"
+                }).applymap(lambda v: 'color: green' if v < 0 else 'color: red', subset=['帳面損益 (%)']),
+                use_container_width=True
+            )
+        else:
+            st.success("目前沒有持股低於成本價！")
+    else:
+        st.info("點擊按鈕開始計算每檔成分股的成本與現價比較。")
 
-    # 顯示雷區結果與互動圖表
-    if st.session_state.underwater_data is not None and not st.session_state.underwater_data.empty:
-        df_show = st.session_state.underwater_data.sort_values("帳面損益 (%)")
-        
-        # 顯示表格
-        st.dataframe(
-            df_show.style.format({
-                "現價": "{:.2f}", 
-                "981成本": "{:.2f}",
-                "帳面損益 (%)": "{:.2f}%"
-            }).applymap(lambda v: 'color: green', subset=['帳面損益 (%)']), # 負數顯示綠色
-            use_container_width=True
-        )
-
-        # 修正需求 2: 點選股票跳出 K 線圖
-        st.divider()
-        st.write("### 🔍 詳細分析 (點選下方股票查看圖表)")
-        
-        # 製作選單選項
-        select_options = df_show.apply(lambda x: f"{x['代號']} {x['名稱']}", axis=1).tolist()
-        selected_stock = st.selectbox("選擇要分析的潛在雷區股票:", select_options)
-        
-        if selected_stock:
-            target_sid = selected_stock.split(" ")[0]
-            target_name = selected_stock.split(" ")[1]
-            # 呼叫共用的繪圖函式
-            draw_stock_chart(target_sid, target_name, df_files)
-
-    elif st.session_state.underwater_data is not None:
-        st.success("目前沒有持股低於成本價！")
+    # 顯示最新持股清單
+    st.subheader(f"📋 最新持股清單 ({latest_date_record.strftime('%Y-%m-%d')})")
+    st.dataframe(df_latest, use_container_width=True)
 
 # =========================================================
 # 頁面 B: 每日持倉變化
@@ -378,12 +319,16 @@ if menu == "總覽 (Dashboard)":
 elif menu == "每日持倉變化":
     st.header("📅 每日持倉變化分析")
     
+    # 1. 日期選擇器
     col_date, col_dummy = st.columns([1, 3])
     with col_date:
+        # 預設選最新日期
         default_date = latest_date_record.date()
         pick_date = st.date_input("選擇查詢日期", default_date)
         pick_date_ts = pd.to_datetime(pick_date)
 
+    # 2. 尋找 當日 與 前一日
+    # 在 df_files 中找
     curr_record = df_files[df_files['date'] == pick_date_ts]
     
     if curr_record.empty:
@@ -392,102 +337,128 @@ elif menu == "每日持倉變化":
         
     curr_idx = curr_record.index[0]
     prev_idx = curr_idx - 1
+    
     path_curr = curr_record.iloc[0]['path']
     
     if prev_idx < 0:
-        st.warning("這是第一天資料，無法比較。")
+        st.warning("這是資料庫的第一天，無法比較變化。")
+        df_curr = parse_excel_holding(path_curr)
+        st.dataframe(df_curr)
         st.stop()
         
     path_prev = df_files.iloc[prev_idx]['path']
+    date_prev = df_files.iloc[prev_idx]['date']
     
-    # 讀取並合併
+    st.write(f"正在比較: **{pick_date}** vs **{date_prev.strftime('%Y-%m-%d')}**")
+    
+    # 3. 讀取並合併
     df_t = parse_excel_holding(path_curr)
     df_y = parse_excel_holding(path_prev)
     
-    m = pd.merge(df_y[['ID', 'Name', 'Shares_num']], 
-                 df_t[['ID', 'Name', 'Shares_num', 'Weight_str']], 
+    m = pd.merge(df_y[['ID', 'Name', 'Shares']], 
+                 df_t[['ID', 'Name', 'Shares', 'Weight']], 
                  on='ID', how='outer', suffixes=('_old', '_new'))
     
     m['Name'] = m['Name_new'].combine_first(m['Name_old']).fillna("未知")
     m = m.fillna(0)
-    m['股數變化'] = m['Shares_num_new'] - m['Shares_num_old']
+    m['股數變化'] = m['Shares_new'] - m['Shares_old']
     
     # 篩選變動股
     df_change = m[m['股數變化'] != 0].copy()
     
-    # 修正需求 3: 表格欄位與格式還原
+    # 4. 估算增減金額 (需要當日股價)
+    st.subheader("💰 增減金額估算")
     if df_change.empty:
         st.info("今日持股無變化。")
     else:
-        # 下載變動股的當日收盤價來算差額
+        # 下載變動股的當日收盤價
         change_sids = df_change['ID'].tolist()
         tickers_change = [f"{sid}.TW" for sid in change_sids]
-        price_map = {}
         
-        with st.spinner("計算差額中..."):
+        price_map = {}
+        with st.spinner("下載變動股股價中..."):
+            # 下載這兩天的資料即可，取最新
             dl_start = pick_date_ts - timedelta(days=5) 
             dl_end = pick_date_ts + timedelta(days=1)
             try:
                 df_prices = yf.download(tickers_change, start=dl_start, end=dl_end, group_by='ticker', progress=False, auto_adjust=True)
+                
                 for sid in change_sids:
                     ticker = f"{sid}.TW"
                     try:
-                        if len(change_sids) > 1: p_data = df_prices[ticker]
-                        else: p_data = df_prices
+                        if len(change_sids) > 1:
+                            p_data = df_prices[ticker]
+                        else:
+                            p_data = df_prices
+                        
+                        # 找 pick_date 當天或最接近的一天
                         p_at_date = p_data[p_data.index <= pick_date_ts].iloc[-1]['Close']
                         price_map[sid] = p_at_date
-                    except: price_map[sid] = 0
-            except: pass
+                    except:
+                        price_map[sid] = 0
+            except:
+                pass
         
-        # 計算差額金額
         df_change['參考股價'] = df_change['ID'].map(price_map)
-        df_change['差額數值'] = df_change['股數變化'] * df_change['參考股價']
-        df_change['差額'] = df_change['差額數值'].apply(format_money_label)
+        df_change['估算金額'] = df_change['股數變化'] * df_change['參考股價']
         
-        # 整理欄位 (還原您 Excel 的欄位名稱)
-        # '股票代號' (ID), '股票名稱' (Name), '持股權重' (Weight_str), '前股數', '今股數', '股數變化', '差額'
-        df_final_table = df_change[[
-            'ID', 'Name', 'Weight_str', 'Shares_num_old', 'Shares_num_new', '股數變化', '差額'
-        ]].rename(columns={
-            'ID': '股票代號', 'Name': '股票名稱', 'Weight_str': '持股權重',
-            'Shares_num_old': '前股數', 'Shares_num_new': '今股數'
-        })
+        # 格式化顯示
+        df_show = df_change[['ID', 'Name', 'Shares_old', 'Shares_new', '股數變化', '參考股價', '估算金額', 'Weight']].sort_values('估算金額', ascending=False)
         
-        # 排序 (依照差額絕對值或股數變化)
-        # 這裡為了對齊 Excel 邏輯，可自行決定排序，目前依照股數變化
-        df_final_table = df_final_table.sort_values('股數變化', ascending=False)
-
-        # 設定樣式 (紅綠變色)
-        def highlight_diff(val):
-            if isinstance(val, (int, float)):
-                if val > 0: return 'color: red'
-                elif val < 0: return 'color: green'
-            return ''
-            
-        def highlight_money(val):
-            # 簡單判斷字串內容是正數概念還是負數
-            # 您的 format_money_label 如果是負數會帶有 "-" 號
-            if '-' in str(val): return 'color: green'
-            if str(val) == "0": return ''
-            return 'color: red'
-
         st.dataframe(
-            df_final_table.style
-            .format({'前股數': '{:,.0f}', '今股數': '{:,.0f}', '股數變化': '{:,.0f}'})
-            .applymap(highlight_diff, subset=['股數變化'])
-            .applymap(highlight_money, subset=['差額']),
+            df_show.style.format({
+                'Shares_old': "{:,.0f}", 'Shares_new': "{:,.0f}", '股數變化': "{:,.0f}",
+                '參考股價': "{:.2f}", '估算金額': "{:,.0f}", 'Weight': "{:.2f}"
+            }).bar(subset=['股數變化', '估算金額'], align='mid', color=['#d65f5f', '#5fba7d']),
             use_container_width=True
         )
 
-        # 互動圖表
-        st.divider()
-        st.subheader("📈 變動個股技術分析 (含成本線)")
+    # 5. 個股互動 K 線圖 (含成本)
+    st.divider()
+    st.subheader("📈 變動個股技術分析 (含成本線)")
+    
+    if not df_change.empty:
+        # 下拉選單選擇股票
+        selected_stock_label = st.selectbox(
+            "選擇要查看的股票:", 
+            options=df_change['ID'] + " " + df_change['Name']
+        )
         
-        # 選單
-        select_options_daily = df_change.apply(lambda x: f"{x['ID']} {x['Name']}", axis=1).tolist()
-        selected_stock_daily = st.selectbox("選擇股票:", select_options_daily)
-        
-        if selected_stock_daily:
-            sid_daily = selected_stock_daily.split(" ")[0]
-            name_daily = selected_stock_daily.split(" ")[1]
-            draw_stock_chart(sid_daily, name_daily, df_files)
+        if selected_stock_label:
+            target_sid = selected_stock_label.split(" ")[0]
+            
+            # 抓取該股完整歷史股價 (1年) 以繪圖
+            chart_start = datetime.now() - timedelta(days=365)
+            df_chart_price = get_stock_price_history(f"{target_sid}.TW", chart_start)
+            
+            if not df_chart_price.empty:
+                # 計算成本線
+                dates, cost_line, shares_series, diff_series = calculate_avg_cost(df_files, target_sid, df_chart_price)
+                
+                # 計算金額柱狀圖
+                amounts = diff_series * df_chart_price['Close'].values
+                
+                # 繪圖
+                fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
+                                    row_heights=[0.6, 0.2, 0.2], vertical_spacing=0.05,
+                                    subplot_titles=("股價 & 成本", "持股水位", "增減金額"))
+                
+                # Row 1: K線 + 成本
+                fig.add_trace(go.Candlestick(x=dates, open=df_chart_price['Open'], high=df_chart_price['High'],
+                                             low=df_chart_price['Low'], close=df_chart_price['Close'], name='股價'), row=1, col=1)
+                
+                fig.add_trace(go.Scatter(x=dates, y=cost_line, mode='lines', 
+                                         line=dict(color='orange', width=2, dash='dot'), name='981成本'), row=1, col=1)
+                
+                # Row 2: 持股數
+                fig.add_trace(go.Scatter(x=dates, y=shares_series, mode='lines+markers',
+                                         fill='tozeroy', line=dict(color='blue'), name='持股數'), row=2, col=1)
+                
+                # Row 3: 增減金額
+                colors = ['red' if x > 0 else 'green' for x in amounts]
+                fig.add_trace(go.Bar(x=dates, y=amounts, marker_color=colors, name='淨買賣額'), row=3, col=1)
+                
+                fig.update_layout(height=800, xaxis_rangeslider_visible=False, title_text=f"{selected_stock_label} 交易分析")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.error("無法下載股價資料")
