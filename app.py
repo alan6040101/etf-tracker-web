@@ -122,7 +122,7 @@ def get_all_holdings_history(_df_files):
 
 @st.cache_data(ttl=3600)
 def get_bulk_prices(sids, start_dt, end_dt):
-    """【容錯優化】雙重抓取：先抓上市，失敗再抓上櫃，確保不出錯"""
+    """【容錯優化】雙重抓取：先抓上市，失敗再抓上櫃，並解決單檔股票 MultiIndex 錯誤"""
     price_map = {}
     missing = []
     
@@ -133,7 +133,14 @@ def get_bulk_prices(sids, start_dt, end_dt):
         df_tw = yf.download(tickers_tw, start=start_dt, end=end_dt, group_by='ticker', progress=False, auto_adjust=True)
         for sid in sids:
             try:
-                s_data = df_tw[f"{sid}.TW"] if len(sids) > 1 else df_tw
+                # 解決單一股票回傳 MultiIndex 導致 KeyError 的問題
+                if len(sids) > 1:
+                    s_data = df_tw[f"{sid}.TW"]
+                else:
+                    s_data = df_tw
+                    if isinstance(s_data.columns, pd.MultiIndex):
+                        s_data.columns = s_data.columns.get_level_values(0)
+                        
                 s_data = s_data.dropna()
                 if not s_data.empty: price_map[sid] = s_data
                 else: missing.append(sid)
@@ -146,7 +153,13 @@ def get_bulk_prices(sids, start_dt, end_dt):
             df_two = yf.download(tickers_two, start=start_dt, end=end_dt, group_by='ticker', progress=False, auto_adjust=True)
             for sid in missing:
                 try:
-                    s_data = df_two[f"{sid}.TWO"] if len(missing) > 1 else df_two
+                    if len(missing) > 1:
+                        s_data = df_two[f"{sid}.TWO"]
+                    else:
+                        s_data = df_two
+                        if isinstance(s_data.columns, pd.MultiIndex):
+                            s_data.columns = s_data.columns.get_level_values(0)
+                            
                     s_data = s_data.dropna()
                     if not s_data.empty: price_map[sid] = s_data
                 except: pass
@@ -186,14 +199,11 @@ def get_etf_cash_history(_df_files):
 # ---------------------------------------------------------
 
 def calculate_avg_cost_optimized(df_history, target_sid, price_df):
-    """【效能優化】直接查詢快取歷史，不重新讀取 Excel"""
     if price_df.empty or df_history.empty: return [], [], [], []
     
-    # 篩選該股票的歷史持股紀錄
     df_stock = df_history[df_history['ID'] == str(target_sid)][['Date', 'Shares_num']].copy()
     df_h = df_stock.rename(columns={'Shares_num': 'Shares'}).sort_values('Date').set_index('Date')
     
-    # 對齊交易日
     df_calc = price_df[['Close']].join(df_h, how='left')
     df_calc['Shares'] = df_calc['Shares'].ffill().fillna(0)
     df_calc['Diff'] = df_calc['Shares'].diff().fillna(0)
@@ -222,10 +232,8 @@ def calculate_avg_cost_optimized(df_history, target_sid, price_df):
     return df_calc.index, cost_line, shares_series, diff_series
 
 def draw_analysis_chart(sid, name, df_history, unique_key_prefix):
-    """繪製個股詳細分析圖 (包含遮蔽六日空窗期)"""
     chart_start = datetime.now() - timedelta(days=365)
     
-    # 下載單檔股價 (含容錯)
     price_map = get_bulk_prices([sid], chart_start, datetime.now() + timedelta(days=1))
     df_chart_price = price_map.get(sid, pd.DataFrame())
     
@@ -236,7 +244,6 @@ def draw_analysis_chart(sid, name, df_history, unique_key_prefix):
     dates, cost_line, shares_series, diff_series = calculate_avg_cost_optimized(df_history, sid, df_chart_price)
     amounts = diff_series * df_chart_price['Close'].values
 
-    # 將日期轉為字串格式，Plotly 就不會自動補齊六日，解決 K 線圖斷層問題
     str_dates = dates.strftime('%Y-%m-%d')
 
     fig = make_subplots(
@@ -266,10 +273,9 @@ def draw_analysis_chart(sid, name, df_history, unique_key_prefix):
     ), row=3, col=1)
     
     fig.update_layout(height=800, xaxis_rangeslider_visible=False, template="plotly_white")
-    fig.update_xaxes(type='category', nticks=10) # 強制使用類別軸避免斷層
+    fig.update_xaxes(type='category', nticks=10) 
     st.plotly_chart(fig, use_container_width=True, key=f"{unique_key_prefix}_chart_{sid}")
 
-# 彈窗函式
 @st.dialog("個股詳細分析", width="large")
 def show_stock_dialog(sid, name, df_history):
     draw_analysis_chart(sid, name, df_history, "dialog")
@@ -287,7 +293,6 @@ if df_files.empty:
     st.error("找不到資料，請確認 GitHub 連結。")
     st.stop()
 
-# 預載快取
 df_history_cache = get_all_holdings_history(df_files)
 
 latest_date_record = df_files.iloc[-1]['date']
@@ -309,7 +314,6 @@ if menu == "總覽 (Dashboard)":
         st.subheader("00981a 近一年走勢與現金權重")
         start_d = datetime.now() - timedelta(days=365)
         
-        # 取得 ETF 價格 (加入上市/上櫃容錯處理)
         etf_price_map = get_bulk_prices(["00981A", "00981"], start_d, datetime.now() + timedelta(days=1))
         df_etf = etf_price_map.get("00981A", etf_price_map.get("00981", pd.DataFrame()))
         
@@ -318,7 +322,6 @@ if menu == "總覽 (Dashboard)":
             df_etf_comb = df_etf.join(df_cw, how='left')
             df_etf_comb['Cash_Weight'] = df_etf_comb['Cash_Weight'].ffill().fillna(0)
             
-            # 使用字串日期避免 K 線圖中間出現斷層
             str_dates = df_etf_comb.index.strftime('%Y-%m-%d')
 
             fig = make_subplots(
@@ -335,7 +338,7 @@ if menu == "總覽 (Dashboard)":
             ), row=2, col=1)
 
             fig.update_layout(height=500, xaxis_rangeslider_visible=False, margin=dict(l=20, r=20, t=20, b=20))
-            fig.update_xaxes(type='category', nticks=10) # 消除六日與國定假日的視覺空窗
+            fig.update_xaxes(type='category', nticks=10)
             st.plotly_chart(fig, use_container_width=True, key="dashboard_main_chart")
         else:
             st.warning("無法取得 00981A 資料。")
@@ -387,10 +390,8 @@ if menu == "總覽 (Dashboard)":
         if not df_underwater.empty:
             df_underwater = df_underwater.sort_values("帳面損益")
             
-            # 【無勾選框的自訂互動式排版】
             st.markdown("💡 **直接點擊【股票名稱按鈕】即可彈出 K 線圖與成本分析**")
             
-            # 表頭
             cols = st.columns([1, 2, 1, 1, 1.5])
             cols[0].markdown("**股票代號**")
             cols[1].markdown("**股票名稱 (點擊看圖)**")
@@ -398,12 +399,10 @@ if menu == "總覽 (Dashboard)":
             cols[3].markdown("**981成本**")
             cols[4].markdown("**帳面損益 (%)**")
             
-            # 資料列
             for _, row in df_underwater.iterrows():
                 cols = st.columns([1, 2, 1, 1, 1.5])
                 cols[0].write(row['代號'])
                 
-                # 讓名稱變成按鈕，點擊觸發彈窗
                 if cols[1].button(f"{row['名稱']}", key=f"btn_uw_{row['代號']}", use_container_width=True):
                     show_stock_dialog(row['代號'], row['名稱'], df_history_cache)
                     
@@ -451,14 +450,12 @@ elif menu == "每日持倉變化":
             m = m.fillna(0)
             m['股數變化'] = m['Shares_num_new'] - m['Shares_num_old']
             
-            # 保留今日有持股，或是昨日有持股 (被刪除) 的所有紀錄
             df_change = m[(m['Shares_num_old'] != 0) | (m['Shares_num_new'] != 0)].copy()
             
-            # 取得變動股的精準股價 (確保不會因為上櫃漏接導致差額為 0)
             sids_change = df_change[df_change['股數變化'] != 0]['ID'].tolist()
             price_map = {}
             if sids_change:
-                dl_start = pick_date_ts - timedelta(days=7) # 多抓幾天避免連假
+                dl_start = pick_date_ts - timedelta(days=7) 
                 bulk_p_map = get_bulk_prices(sids_change, dl_start, pick_date_ts + timedelta(days=1))
                 
                 for sid in sids_change:
@@ -482,17 +479,15 @@ elif menu == "每日持倉變化":
                     '前股數': int(row['Shares_num_old']), '今股數': int(row['Shares_num_new']),
                     '股數變化': int(row['股數變化']), '差額': diff_txt, 
                     'Weight_num': row['Weight_num'], 
-                    'Is_Zero': int(row['Shares_num_new']) == 0 # 用於判斷是否被刪除
+                    'Is_Zero': int(row['Shares_num_new']) == 0
                 })
             
             df_display = pd.DataFrame(display_rows)
             
             if not df_display.empty:
-                # 【邏輯修正】：被刪除(今股數=0)排最後 -> 其餘依據持股權重排行
                 df_display = df_display.sort_values(by=['Is_Zero', 'Weight_num'], ascending=[True, False])
                 
                 st.subheader("📋 持股變化表")
-                # hide_index=True 隱藏最前方的序號欄位
                 st.dataframe(
                     df_display.drop(columns=['Weight_num', 'Is_Zero']).style.applymap(
                         lambda v: 'color: red' if v > 0 else 'color: green' if v < 0 else '', 
