@@ -122,7 +122,7 @@ def get_all_holdings_history(_df_files):
 
 @st.cache_data(ttl=3600)
 def get_bulk_prices(sids, start_dt, end_dt):
-    """【修正核心】完美解決單一與多檔股票 MultiIndex 錯誤"""
+    """取得股價並解決 MultiIndex 及時區問題"""
     price_map = {}
     missing = []
     
@@ -130,11 +130,9 @@ def get_bulk_prices(sids, start_dt, end_dt):
     tickers_tw = [f"{sid}.TW" for sid in sids]
     
     def normalize_columns(df):
-        # 統一將小寫的 close, open 轉為大寫，確保後續擷取安全
         return df.rename(columns=lambda x: str(x).capitalize() if str(x).lower() in ['close', 'open', 'high', 'low', 'volume'] else x)
         
     try:
-        # 移除 group_by='ticker'，讓預設的 MultiIndex 機制處理
         df_tw = yf.download(tickers_tw, start=start_dt, end=end_dt, progress=False, auto_adjust=True)
         for sid in sids:
             ticker = f"{sid}.TW"
@@ -152,6 +150,10 @@ def get_bulk_prices(sids, start_dt, end_dt):
                 
                 if 'Close' in s_data.columns:
                     s_data = s_data.dropna(subset=['Close'])
+                    # 【修正1】強制移除時區，避免與 Excel 日期合併時產生斷層
+                    if hasattr(s_data.index, 'tz') and s_data.index.tz is not None:
+                        s_data.index = s_data.index.tz_localize(None)
+                    
                     if not s_data.empty: price_map[sid] = s_data
                     else: missing.append(sid)
                 else:
@@ -178,6 +180,10 @@ def get_bulk_prices(sids, start_dt, end_dt):
                     
                     if 'Close' in s_data.columns:
                         s_data = s_data.dropna(subset=['Close'])
+                        # 【修正1】強制移除時區
+                        if hasattr(s_data.index, 'tz') and s_data.index.tz is not None:
+                            s_data.index = s_data.index.tz_localize(None)
+                        
                         if not s_data.empty: price_map[sid] = s_data
                 except: pass
         except: pass
@@ -269,9 +275,11 @@ def draw_analysis_chart(sid, name, df_history, unique_key_prefix):
         subplot_titles=(f"<b>{sid} {name} 股價與成本</b>", "<b>持股水位</b>", "<b>每日增減金額</b>")
     )
     
+    # 【修正2】自訂 K 棒顏色為紅漲綠跌
     fig.add_trace(go.Candlestick(
         x=str_dates, open=df_chart_price['Open'], high=df_chart_price['High'],
-        low=df_chart_price['Low'], close=df_chart_price['Close'], name='股價'
+        low=df_chart_price['Low'], close=df_chart_price['Close'], name='股價',
+        increasing_line_color='red', decreasing_line_color='green'
     ), row=1, col=1)
     
     fig.add_trace(go.Scatter(
@@ -345,10 +353,14 @@ if menu == "總覽 (Dashboard)":
                 rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05,
                 subplot_titles=("<b>00981a K線</b>", "<b>現金權重走勢 (%)</b>")
             )
+            
+            # 【修正2】自訂 K 棒顏色為紅漲綠跌
             fig.add_trace(go.Candlestick(
                 x=str_dates, open=df_etf_comb['Open'], high=df_etf_comb['High'],
-                low=df_etf_comb['Low'], close=df_etf_comb['Close'], name='K線'
+                low=df_etf_comb['Low'], close=df_etf_comb['Close'], name='K線',
+                increasing_line_color='red', decreasing_line_color='green'
             ), row=1, col=1)
+            
             fig.add_trace(go.Scatter(
                 x=str_dates, y=df_etf_comb['Cash_Weight'], mode='lines', 
                 line=dict(color='#17becf', width=2), fill='tozeroy', name='現金權重'
