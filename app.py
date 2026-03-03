@@ -9,82 +9,11 @@ import os
 import shutil
 import glob
 import re
-import concurrent.futures
 
 # ---------------------------------------------------------
-# 設定頁面配置 & 旗艦級 UI CSS 注入
+# 設定頁面配置 (還原為原本明亮簡潔風格)
 # ---------------------------------------------------------
-st.set_page_config(page_title="00981a ETF 追蹤器", layout="wide", initial_sidebar_state="expanded")
-
-st.markdown("""
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
-    
-    html, body, [class*="css"] {
-        font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    }
-    
-    /* 現代深色背景 */
-    .stApp {
-        background-color: #0E1117;
-        color: #E2E8F0;
-    }
-    
-    /* 側邊欄優化 */
-    [data-testid="stSidebar"] {
-        background-color: #151821;
-        border-right: 1px solid #2D3748;
-    }
-    
-    /* KPI 卡片視覺升級 */
-    div[data-testid="metric-container"] {
-        background-color: #1A202C;
-        border: 1px solid #2D3748;
-        padding: 20px;
-        border-radius: 12px;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.5);
-    }
-    div[data-testid="metric-container"] label {
-        color: #A0AEC0 !important;
-        font-weight: 500;
-        font-size: 1.05rem;
-    }
-    div[data-testid="metric-container"] div {
-        color: #F7FAFC !important;
-    }
-    
-    /* 按鈕漸層與懸浮效果 */
-    .stButton > button {
-        background: linear-gradient(135deg, #3182CE 0%, #2B6CB0 100%);
-        color: white !important;
-        border: none;
-        border-radius: 8px;
-        font-weight: 600;
-        letter-spacing: 0.5px;
-        transition: all 0.3s ease;
-        box-shadow: 0 4px 6px rgba(49, 130, 206, 0.2);
-    }
-    .stButton > button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 6px 12px rgba(49, 130, 206, 0.4);
-    }
-    
-    /* 標題與分隔線 */
-    h1, h2, h3 { color: #F7FAFC !important; font-weight: 600; }
-    hr { border-color: #2D3748; margin-top: 2rem; margin-bottom: 2rem; }
-</style>
-""", unsafe_allow_html=True)
-
-# 專業版 Plotly 畫布設定
-premium_layout = dict(
-    template="plotly_dark",
-    paper_bgcolor="rgba(0,0,0,0)",
-    plot_bgcolor="rgba(0,0,0,0)",
-    font=dict(color="#A0AEC0", size=13),
-    xaxis=dict(showgrid=True, gridcolor="#2D3748", linecolor="#2D3748", zeroline=False),
-    yaxis=dict(showgrid=True, gridcolor="#2D3748", linecolor="#2D3748", zeroline=False),
-    margin=dict(l=15, r=15, t=40, b=15)
-)
+st.set_page_config(page_title="00981a ETF 追蹤器", layout="wide")
 
 # ---------------------------------------------------------
 # 1. 資料庫與解析核心
@@ -92,6 +21,7 @@ premium_layout = dict(
 
 @st.cache_data(ttl=3600)
 def sync_data_repo():
+    """同步 GitHub 資料庫"""
     repo_url = "https://github.com/alan6040101/00981a-data.git"
     dir_name = "data_00981a"
     if os.path.exists(dir_name):
@@ -129,6 +59,7 @@ def format_money_label(val):
     return f"{int(round(val)):,}"
 
 def parse_excel_holding(path):
+    """讀取並解析單一 Excel"""
     try: df_raw = pd.read_excel(path, header=None, nrows=30)
     except: return pd.DataFrame()
 
@@ -173,7 +104,7 @@ def parse_excel_holding(path):
     return pd.DataFrame()
 
 # ---------------------------------------------------------
-# 2. 效能優化與多執行緒報價引擎 (徹底解決斷層問題)
+# 2. 效能優化引擎 (快取擊碎與單兵抓取架構)
 # ---------------------------------------------------------
 
 @st.cache_data(ttl=3600)
@@ -188,54 +119,53 @@ def get_all_holdings_history(_df_files):
         return pd.concat(all_records, ignore_index=True)
     return pd.DataFrame()
 
-def _fetch_clean_price(ticker, start_dt, end_dt):
-    """單獨抓取函式，避免 yfinance 批次處理產生的 DataFrame 覆寫 Bug"""
-    try:
-        df = yf.download(ticker, start=start_dt, end=end_dt, progress=False, auto_adjust=True)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        
-        if df.empty: return None
-        df = df.rename(columns=lambda x: str(x).capitalize() if str(x).lower() in ['close', 'open', 'high', 'low', 'volume'] else x)
-        
-        if 'Close' not in df.columns: return None
-        df = df.dropna(subset=['Close'])
-        
-        if hasattr(df.index, 'tz') and df.index.tz is not None:
-            df.index = df.index.tz_localize(None)
-        df.index = pd.to_datetime(df.index).normalize()
-        df = df[~df.index.duplicated(keep='last')]
-        return df if not df.empty else None
-    except:
-        return None
-
+# 【核心修正】更改函式名稱為 fetch_stock_data_v3 強制無效化舊快取
+# 廢除 yf.download 批量下載，改為安全單兵下載，確保 K 棒零斷層
 @st.cache_data(ttl=3600)
-def get_bulk_prices(sids, start_dt, end_dt):
-    """【終極解決方案】使用多執行緒獨立抓取 TW 與 TWO，100% 保留歷史不斷層"""
+def fetch_stock_data_v3(sids, start_dt, end_dt):
     price_map = {}
     if not sids: return price_map
-
-    def fetch_sid(sid):
-        df_tw = _fetch_clean_price(f"{sid}.TW", start_dt, end_dt)
-        df_two = _fetch_clean_price(f"{sid}.TWO", start_dt, end_dt)
+    
+    def clean_and_format_price_df(df):
+        if df is None or df.empty: return None
+        # 處理單檔可能依然出現的 MultiIndex
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+            
+        df = df.rename(columns=lambda x: str(x).capitalize() if str(x).lower() in ['close', 'open', 'high', 'low', 'volume'] else x)
         
-        # 完美合併上市與上櫃的歷史資料
-        if df_tw is not None and df_two is not None:
-            return sid, df_tw.combine_first(df_two)
-        elif df_tw is not None:
-            return sid, df_tw
-        elif df_two is not None:
-            return sid, df_two
-        return sid, None
+        if 'Close' in df.columns:
+            df = df.dropna(subset=['Close'])
+            if df.empty: return None
+            # 強制移除時區歸零到午夜，完美對齊 Excel
+            if hasattr(df.index, 'tz') and df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
+            df.index = pd.to_datetime(df.index).normalize()
+            df = df[~df.index.duplicated(keep='last')]
+            return df
+        return None
 
-    # 最高開 15 個執行緒平行處理，速度飛快
-    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-        futures = [executor.submit(fetch_sid, sid) for sid in sids]
-        for future in concurrent.futures.as_completed(futures):
-            sid, df = future.result()
-            if df is not None:
-                price_map[sid] = df
-                
+    for sid in sids:
+        try:
+            # 獨立下載 .TW
+            raw_tw = yf.download(f"{sid}.TW", start=start_dt, end=end_dt, progress=False)
+            cl_tw = clean_and_format_price_df(raw_tw)
+        except: cl_tw = None
+            
+        try:
+            # 獨立下載 .TWO
+            raw_two = yf.download(f"{sid}.TWO", start=start_dt, end=end_dt, progress=False)
+            cl_two = clean_and_format_price_df(raw_two)
+        except: cl_two = None
+        
+        # 精準縫合兩大市場資料，一網打盡
+        if cl_tw is not None and cl_two is not None:
+            price_map[sid] = cl_tw.combine_first(cl_two)
+        elif cl_tw is not None:
+            price_map[sid] = cl_tw
+        elif cl_two is not None:
+            price_map[sid] = cl_two
+
     return price_map
 
 def extract_cash_weight(path):
@@ -305,7 +235,7 @@ def calculate_avg_cost_optimized(df_history, target_sid, price_df):
 def draw_analysis_chart(sid, name, df_history, unique_key_prefix):
     chart_start = datetime.now() - timedelta(days=365)
     
-    price_map = get_bulk_prices([sid], chart_start, datetime.now() + timedelta(days=1))
+    price_map = fetch_stock_data_v3([sid], chart_start, datetime.now() + timedelta(days=1))
     df_chart_price = price_map.get(sid, pd.DataFrame())
     
     if df_chart_price.empty:
@@ -319,37 +249,36 @@ def draw_analysis_chart(sid, name, df_history, unique_key_prefix):
     fig = make_subplots(
         rows=3, cols=1, shared_xaxes=True, 
         row_heights=[0.6, 0.2, 0.2], vertical_spacing=0.05,
-        subplot_titles=(f"<b>{sid} {name} 股價與成本分析</b>", "<b>持股水位</b>", "<b>每日增減金額</b>")
+        subplot_titles=(f"<b>{sid} {name} 股價與成本</b>", "<b>持股水位</b>", "<b>每日增減金額</b>")
     )
     
-    # K線：精準校正為台股看盤色彩 (紅漲綠跌)
+    # K線：紅漲綠跌
     fig.add_trace(go.Candlestick(
         x=str_dates, open=df_chart_price['Open'], high=df_chart_price['High'],
         low=df_chart_price['Low'], close=df_chart_price['Close'], name='股價',
-        increasing_line_color='#F23645', increasing_fillcolor='#F23645',
-        decreasing_line_color='#089981', decreasing_fillcolor='#089981'
+        increasing_line_color='red', decreasing_line_color='green'
     ), row=1, col=1)
     
     fig.add_trace(go.Scatter(
         x=str_dates, y=cost_line, mode='lines', 
-        line=dict(color='#ECC94B', width=2, dash='dot'), name='981成本'
+        line=dict(color='orange', width=2, dash='dot'), name='981成本'
     ), row=1, col=1)
     
     fig.add_trace(go.Scatter(
         x=str_dates, y=shares_series, mode='lines+markers',
-        fill='tozeroy', line=dict(color='#4299E1', width=2), fillcolor='rgba(66, 153, 225, 0.15)', name='持股數'
+        fill='tozeroy', line=dict(color='blue'), name='持股數'
     ), row=2, col=1)
     
-    colors = ['#F23645' if x > 0 else '#089981' for x in amounts]
+    colors = ['red' if x > 0 else 'green' for x in amounts]
     fig.add_trace(go.Bar(
         x=str_dates, y=amounts, marker_color=colors, name='淨買賣額'
     ), row=3, col=1)
     
-    fig.update_layout(**premium_layout, height=800, xaxis_rangeslider_visible=False)
+    fig.update_layout(height=800, xaxis_rangeslider_visible=False, template="plotly_white")
     fig.update_xaxes(type='category', nticks=10) 
     st.plotly_chart(fig, use_container_width=True, key=f"{unique_key_prefix}_chart_{sid}")
 
-@st.dialog("個股深度分析", width="large")
+@st.dialog("個股詳細分析", width="large")
 def show_stock_dialog(sid, name, df_history):
     draw_analysis_chart(sid, name, df_history, "dialog")
 
@@ -357,9 +286,9 @@ def show_stock_dialog(sid, name, df_history):
 # 4. 網頁主介面
 # ---------------------------------------------------------
 
-st.title("📊 00981a 專業追蹤戰情室")
+st.title("📊 00981a ETF 追蹤器")
 
-with st.spinner('正在同步資料庫與初始化核心...'):
+with st.spinner('正在同步資料庫...'):
     df_files = sync_data_repo()
 
 if df_files.empty:
@@ -370,58 +299,41 @@ df_history_cache = get_all_holdings_history(df_files)
 
 latest_date_record = df_files.iloc[-1]['date']
 latest_path = df_files.iloc[-1]['path']
+st.sidebar.info(f"最新資料日期: {latest_date_record.strftime('%Y-%m-%d')}")
 
-# 側邊欄設計
-with st.sidebar:
-    st.markdown("### ⚙️ 控制面板")
-    st.info(f"📅 最新資料庫更新：\n**{latest_date_record.strftime('%Y-%m-%d')}**")
-    menu = st.radio("功能切換", ["總覽 (Dashboard)", "每日持倉變化"])
+menu = st.sidebar.radio("功能選單", ["總覽 (Dashboard)", "每日持倉變化"])
 
 # =========================================================
 # 頁面 A: 總覽 (Dashboard)
 # =========================================================
 if menu == "總覽 (Dashboard)":
+    st.header("📈 00981a 總覽")
     df_latest = parse_excel_holding(latest_path)
-    start_d = datetime.now() - timedelta(days=365)
-    
-    # 預先抓取 ETF 資料供 KPI 使用
-    etf_price_map = get_bulk_prices(["00981A", "00981"], start_d, datetime.now() + timedelta(days=1))
-    df_etf_A = etf_price_map.get("00981A", pd.DataFrame())
-    df_etf_B = etf_price_map.get("00981", pd.DataFrame())
-    
-    # 無縫拼接 ETF 歷史資料
-    if not df_etf_A.empty and not df_etf_B.empty: df_etf = df_etf_A.combine_first(df_etf_B)
-    elif not df_etf_A.empty: df_etf = df_etf_A
-    else: df_etf = df_etf_B
 
-    df_cw = get_etf_cash_history(df_files)
-    latest_cash = df_cw['Cash_Weight'].iloc[-1] if not df_cw.empty else 0.0
-    
-    # --- KPI 數據卡片區 ---
-    st.markdown("### 💡 核心指標")
-    k1, k2, k3, k4 = st.columns(4)
-    if not df_etf.empty:
-        curr_price = df_etf['Close'].iloc[-1]
-        prev_price = df_etf['Close'].iloc[-2] if len(df_etf) > 1 else curr_price
-        pct_change = (curr_price - prev_price) / prev_price * 100
-        k1.metric("00981a 最新收盤價", f"{curr_price:.2f}", f"{pct_change:+.2f}%")
-    else:
-        k1.metric("00981a 最新收盤價", "載入中...", "")
-    
-    k2.metric("最新現金水位", f"{latest_cash:.2f}%")
-    k3.metric("總持股檔數", f"{len(df_latest)} 檔")
-    k4.metric("資料更新狀態", "即時同步", "Online")
-    
-    st.markdown("<br>", unsafe_allow_html=True)
-    
-    # --- 圖表與表格區 ---
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        st.markdown("#### 📈 00981a 近一年走勢與現金權重")
+        st.subheader("00981a 近一年走勢與現金權重")
+        start_d = datetime.now() - timedelta(days=365)
+        
+        # 呼叫最新乾淨的 V3 下載引擎
+        etf_price_map = fetch_stock_data_v3(["00981A", "00981"], start_d, datetime.now() + timedelta(days=1))
+        
+        df_etf_A = etf_price_map.get("00981A", pd.DataFrame())
+        df_etf_B = etf_price_map.get("00981", pd.DataFrame())
+        
+        if not df_etf_A.empty and not df_etf_B.empty:
+            df_etf = df_etf_A.combine_first(df_etf_B)
+        elif not df_etf_A.empty:
+            df_etf = df_etf_A
+        else:
+            df_etf = df_etf_B
+        
         if not df_etf.empty:
+            df_cw = get_etf_cash_history(df_files)
             df_etf_comb = df_etf.join(df_cw, how='left')
             df_etf_comb['Cash_Weight'] = df_etf_comb['Cash_Weight'].ffill().fillna(0)
+            
             str_dates = df_etf_comb.index.strftime('%Y-%m-%d')
 
             fig = make_subplots(
@@ -429,50 +341,48 @@ if menu == "總覽 (Dashboard)":
                 subplot_titles=("<b>00981a K線</b>", "<b>現金權重走勢 (%)</b>")
             )
             
+            # K線：紅漲綠跌
             fig.add_trace(go.Candlestick(
                 x=str_dates, open=df_etf_comb['Open'], high=df_etf_comb['High'],
                 low=df_etf_comb['Low'], close=df_etf_comb['Close'], name='K線',
-                increasing_line_color='#F23645', increasing_fillcolor='#F23645',
-                decreasing_line_color='#089981', decreasing_fillcolor='#089981'
+                increasing_line_color='red', decreasing_line_color='green'
             ), row=1, col=1)
             
             fig.add_trace(go.Scatter(
                 x=str_dates, y=df_etf_comb['Cash_Weight'], mode='lines', 
-                line=dict(color='#4299E1', width=2), fill='tozeroy', fillcolor='rgba(66, 153, 225, 0.15)', name='現金權重'
+                line=dict(color='#17becf', width=2), fill='tozeroy', name='現金權重'
             ), row=2, col=1)
 
-            fig.update_layout(**premium_layout, height=480, xaxis_rangeslider_visible=False)
+            fig.update_layout(height=500, xaxis_rangeslider_visible=False, margin=dict(l=20, r=20, t=20, b=20), template="plotly_white")
             fig.update_xaxes(type='category', nticks=10)
             st.plotly_chart(fig, use_container_width=True, key="dashboard_main_chart")
         else:
             st.warning("無法取得 00981A 資料。")
 
     with col2:
-        st.markdown("#### 📋 最新持股 (依權重)")
+        st.subheader("📋 最新持股 (依權重)")
         if not df_latest.empty:
             df_sorted = df_latest.sort_values(by='Weight_num', ascending=False)
             df_show = df_sorted[['ID', 'Name', 'Shares_num', 'Weight_str']].rename(columns={
-                'ID': '代號', 'Name': '名稱', 'Shares_num': '持股數', 'Weight_str': '權重'
+                'ID': '股票代號', 'Name': '股票名稱', 'Shares_num': '持股數', 'Weight_str': '持股權重'
             })
             st.dataframe(
                 df_show.style.format({'持股數': '{:,.0f}'}), 
-                use_container_width=True, height=480, hide_index=True, key="dashboard_weight_table"
+                use_container_width=True, height=400, hide_index=True, key="dashboard_weight_table"
             )
 
     st.divider()
+    st.subheader("⚠️ 股價跌破 ETF 成本線")
     
-    # --- 潛在雷區分析 ---
-    st.markdown("### ⚠️ 股價跌破 ETF 成本線 (自動分析)")
-    
-    if st.button("🚀 啟動一鍵極速運算", type="primary", key="btn_calc_cost"):
+    if st.button("一鍵極速分析", type="primary", key="btn_calc_cost"):
         st.session_state['run_dashboard_analysis'] = True
 
     if st.session_state.get('run_dashboard_analysis'):
         report_data = []
         sids = df_latest['ID'].tolist()
         
-        with st.spinner("正在執行多執行緒成本分析..."):
-            price_map = get_bulk_prices(sids, start_d, datetime.now() + timedelta(days=1))
+        with st.spinner("正在計算成本分析... (已啟用快取引擎，速度飛快！)"):
+            price_map = fetch_stock_data_v3(sids, start_d, datetime.now() + timedelta(days=1))
             
             for row in df_latest.itertuples():
                 sid, name = row.ID, row.Name
@@ -496,12 +406,11 @@ if menu == "總覽 (Dashboard)":
         if not df_underwater.empty:
             df_underwater = df_underwater.sort_values("帳面損益")
             
-            st.info("💡 **提示：直接點擊下方【股票名稱】即可開啟深度技術分析圖表**")
+            st.markdown("💡 **直接點擊【股票名稱按鈕】即可彈出 K 線圖與成本分析**")
             
-            # 自訂美化表格排版
             cols = st.columns([1, 2, 1, 1, 1.5])
             cols[0].markdown("**股票代號**")
-            cols[1].markdown("**股票名稱 (互動圖表)**")
+            cols[1].markdown("**股票名稱 (點擊看圖)**")
             cols[2].markdown("**現價**")
             cols[3].markdown("**981成本**")
             cols[4].markdown("**帳面損益 (%)**")
@@ -516,20 +425,20 @@ if menu == "總覽 (Dashboard)":
                 cols[2].write(f"{row['現價']:.2f}")
                 cols[3].write(f"{row['981成本']:.2f}")
                 
-                color = "#089981" if row['帳面損益'] < 0 else "#F23645"
-                cols[4].markdown(f"<span style='color:{color}; font-weight:600;'>{row['帳面損益']:.2f}%</span>", unsafe_allow_html=True)
+                color = "green" if row['帳面損益'] < 0 else "red"
+                cols[4].markdown(f"<span style='color:{color}'>{row['帳面損益']:.2f}%</span>", unsafe_allow_html=True)
         else:
-            st.success("🎉 目前系統偵測：沒有持股低於成本價！")
+            st.success("目前沒有持股低於成本價！")
 
 # =========================================================
 # 頁面 B: 每日持倉變化
 # =========================================================
 elif menu == "每日持倉變化":
-    st.header("📅 每日持倉變化追蹤")
+    st.header("📅 每日持倉變化")
     
     col_date, _ = st.columns([1, 3])
     with col_date:
-        pick_date = st.date_input("選擇欲查詢日期", latest_date_record.date(), key="daily_date_picker")
+        pick_date = st.date_input("選擇日期", latest_date_record.date(), key="daily_date_picker")
         pick_date_ts = pd.to_datetime(pick_date)
 
     curr_record = df_files[df_files['date'] == pick_date_ts]
@@ -563,7 +472,7 @@ elif menu == "每日持倉變化":
             price_map = {}
             if sids_change:
                 dl_start = pick_date_ts - timedelta(days=7) 
-                bulk_p_map = get_bulk_prices(sids_change, dl_start, pick_date_ts + timedelta(days=1))
+                bulk_p_map = fetch_stock_data_v3(sids_change, dl_start, pick_date_ts + timedelta(days=1))
                 
                 for sid in sids_change:
                     s_data = bulk_p_map.get(sid, pd.DataFrame())
@@ -594,22 +503,22 @@ elif menu == "每日持倉變化":
             if not df_display.empty:
                 df_display = df_display.sort_values(by=['Is_Zero', 'Weight_num'], ascending=[True, False])
                 
-                st.markdown("### 📋 持股變化明細")
+                st.subheader("📋 持股變化表")
                 st.dataframe(
                     df_display.drop(columns=['Weight_num', 'Is_Zero']).style.applymap(
-                        lambda v: 'color: #F23645; font-weight:600;' if v > 0 else 'color: #089981; font-weight:600;' if v < 0 else '', 
+                        lambda v: 'color: red' if v > 0 else 'color: green' if v < 0 else '', 
                         subset=['股數變化']
                     ).format({'前股數': '{:,}', '今股數': '{:,}', '股數變化': '{:,}'}),
                     use_container_width=True, hide_index=True, key="daily_change_table"
                 )
                 
                 st.divider()
-                st.markdown("### 📈 變動個股技術分析")
+                st.subheader("📈 變動個股技術分析")
                 
                 changed_stocks = df_display[df_display['股數變化'] != 0]
                 if not changed_stocks.empty:
                     target_label = st.selectbox(
-                        "🔍 選擇欲檢視的變動個股：", 
+                        "選擇有變動的股票:", 
                         changed_stocks['股票代號'] + " " + changed_stocks['股票名稱'],
                         key="daily_stock_selector"
                     )
