@@ -11,7 +11,7 @@ import glob
 import re
 
 # ---------------------------------------------------------
-# 設定頁面配置 (還原為原本明亮簡潔風格)
+# 設定頁面配置 (維持原本明亮風格)
 # ---------------------------------------------------------
 st.set_page_config(page_title="00981a ETF 追蹤器", layout="wide")
 
@@ -104,7 +104,7 @@ def parse_excel_holding(path):
     return pd.DataFrame()
 
 # ---------------------------------------------------------
-# 2. 效能優化引擎 (快取擊碎與單兵抓取架構)
+# 2. 效能優化引擎 (強制擊碎快取 + 單兵防漏接)
 # ---------------------------------------------------------
 
 @st.cache_data(ttl=3600)
@@ -119,16 +119,14 @@ def get_all_holdings_history(_df_files):
         return pd.concat(all_records, ignore_index=True)
     return pd.DataFrame()
 
-# 【核心修正】更改函式名稱為 fetch_stock_data_v3 強制無效化舊快取
-# 廢除 yf.download 批量下載，改為安全單兵下載，確保 K 棒零斷層
+# 【核心修正】更名為 v4 強制洗掉舊快取
 @st.cache_data(ttl=3600)
-def fetch_stock_data_v3(sids, start_dt, end_dt):
+def fetch_stock_data_v4(sids, start_dt, end_dt):
     price_map = {}
     if not sids: return price_map
     
     def clean_and_format_price_df(df):
         if df is None or df.empty: return None
-        # 處理單檔可能依然出現的 MultiIndex
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
             
@@ -137,7 +135,14 @@ def fetch_stock_data_v3(sids, start_dt, end_dt):
         if 'Close' in df.columns:
             df = df.dropna(subset=['Close'])
             if df.empty: return None
-            # 強制移除時區歸零到午夜，完美對齊 Excel
+            
+            # 【根因解決】填補 Yahoo Finance 常見的開高低價缺失 Bug
+            # 如果 OHL 是 NaN，用 Close 填補，確保 Plotly 一定畫得出 K 棒
+            df['Open'] = df['Open'].fillna(df['Close'])
+            df['High'] = df['High'].fillna(df['Close'])
+            df['Low'] = df['Low'].fillna(df['Close'])
+            
+            # 強制統一時間格式
             if hasattr(df.index, 'tz') and df.index.tz is not None:
                 df.index = df.index.tz_localize(None)
             df.index = pd.to_datetime(df.index).normalize()
@@ -145,20 +150,18 @@ def fetch_stock_data_v3(sids, start_dt, end_dt):
             return df
         return None
 
+    # 單兵作戰下載，避免互相干擾導致 NaN
     for sid in sids:
         try:
-            # 獨立下載 .TW
             raw_tw = yf.download(f"{sid}.TW", start=start_dt, end=end_dt, progress=False)
             cl_tw = clean_and_format_price_df(raw_tw)
         except: cl_tw = None
             
         try:
-            # 獨立下載 .TWO
             raw_two = yf.download(f"{sid}.TWO", start=start_dt, end=end_dt, progress=False)
             cl_two = clean_and_format_price_df(raw_two)
         except: cl_two = None
         
-        # 精準縫合兩大市場資料，一網打盡
         if cl_tw is not None and cl_two is not None:
             price_map[sid] = cl_tw.combine_first(cl_two)
         elif cl_tw is not None:
@@ -235,7 +238,7 @@ def calculate_avg_cost_optimized(df_history, target_sid, price_df):
 def draw_analysis_chart(sid, name, df_history, unique_key_prefix):
     chart_start = datetime.now() - timedelta(days=365)
     
-    price_map = fetch_stock_data_v3([sid], chart_start, datetime.now() + timedelta(days=1))
+    price_map = fetch_stock_data_v4([sid], chart_start, datetime.now() + timedelta(days=1))
     df_chart_price = price_map.get(sid, pd.DataFrame())
     
     if df_chart_price.empty:
@@ -252,7 +255,7 @@ def draw_analysis_chart(sid, name, df_history, unique_key_prefix):
         subplot_titles=(f"<b>{sid} {name} 股價與成本</b>", "<b>持股水位</b>", "<b>每日增減金額</b>")
     )
     
-    # K線：紅漲綠跌
+    # K線：維持紅漲綠跌
     fig.add_trace(go.Candlestick(
         x=str_dates, open=df_chart_price['Open'], high=df_chart_price['High'],
         low=df_chart_price['Low'], close=df_chart_price['Close'], name='股價',
@@ -316,8 +319,8 @@ if menu == "總覽 (Dashboard)":
         st.subheader("00981a 近一年走勢與現金權重")
         start_d = datetime.now() - timedelta(days=365)
         
-        # 呼叫最新乾淨的 V3 下載引擎
-        etf_price_map = fetch_stock_data_v3(["00981A", "00981"], start_d, datetime.now() + timedelta(days=1))
+        # 呼叫全新的 V4 下載引擎
+        etf_price_map = fetch_stock_data_v4(["00981A", "00981"], start_d, datetime.now() + timedelta(days=1))
         
         df_etf_A = etf_price_map.get("00981A", pd.DataFrame())
         df_etf_B = etf_price_map.get("00981", pd.DataFrame())
@@ -331,8 +334,16 @@ if menu == "總覽 (Dashboard)":
         
         if not df_etf.empty:
             df_cw = get_etf_cash_history(df_files)
-            df_etf_comb = df_etf.join(df_cw, how='left')
+            
+            # 【根因解決】確保日期完全對齊：使用 outer join，確保所有日子都存在
+            df_etf_comb = df_etf.join(df_cw, how='outer')
+            
+            # 針對 YF 真的漏接的天數，把前一天的收盤價沿用下來
+            df_etf_comb[['Open', 'High', 'Low', 'Close']] = df_etf_comb[['Open', 'High', 'Low', 'Close']].ffill()
             df_etf_comb['Cash_Weight'] = df_etf_comb['Cash_Weight'].ffill().fillna(0)
+            
+            # 刪除最初始真的完全沒價格的日期
+            df_etf_comb = df_etf_comb.dropna(subset=['Close'])
             
             str_dates = df_etf_comb.index.strftime('%Y-%m-%d')
 
@@ -341,7 +352,6 @@ if menu == "總覽 (Dashboard)":
                 subplot_titles=("<b>00981a K線</b>", "<b>現金權重走勢 (%)</b>")
             )
             
-            # K線：紅漲綠跌
             fig.add_trace(go.Candlestick(
                 x=str_dates, open=df_etf_comb['Open'], high=df_etf_comb['High'],
                 low=df_etf_comb['Low'], close=df_etf_comb['Close'], name='K線',
@@ -382,7 +392,7 @@ if menu == "總覽 (Dashboard)":
         sids = df_latest['ID'].tolist()
         
         with st.spinner("正在計算成本分析... (已啟用快取引擎，速度飛快！)"):
-            price_map = fetch_stock_data_v3(sids, start_d, datetime.now() + timedelta(days=1))
+            price_map = fetch_stock_data_v4(sids, start_d, datetime.now() + timedelta(days=1))
             
             for row in df_latest.itertuples():
                 sid, name = row.ID, row.Name
@@ -472,7 +482,7 @@ elif menu == "每日持倉變化":
             price_map = {}
             if sids_change:
                 dl_start = pick_date_ts - timedelta(days=7) 
-                bulk_p_map = fetch_stock_data_v3(sids_change, dl_start, pick_date_ts + timedelta(days=1))
+                bulk_p_map = fetch_stock_data_v4(sids_change, dl_start, pick_date_ts + timedelta(days=1))
                 
                 for sid in sids_change:
                     s_data = bulk_p_map.get(sid, pd.DataFrame())
