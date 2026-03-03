@@ -23,7 +23,6 @@ st.set_page_config(page_title="00981a ETF 追蹤器", layout="wide")
 
 @st.cache_data(ttl=3600)
 def sync_data_repo():
-    """同步 GitHub 資料庫"""
     repo_url = "https://github.com/alan6040101/00981a-data.git"
     dir_name = "data_00981a"
     if os.path.exists(dir_name):
@@ -105,7 +104,7 @@ def parse_excel_holding(path):
     return pd.DataFrame()
 
 # ---------------------------------------------------------
-# 2. 效能優化與智慧救援引擎 (V8)
+# 2. 效能優化與智慧救援引擎 (終極 V9: 包含上市+上櫃備援)
 # ---------------------------------------------------------
 
 @st.cache_data(ttl=3600)
@@ -120,12 +119,11 @@ def get_all_holdings_history(_df_files):
         return pd.concat(all_records, ignore_index=True)
     return pd.DataFrame()
 
-# 【官方備援 API】專門向台灣證券交易所索取精確的月度股價
-@st.cache_data(ttl=3600)
+# 【上市備援】TWSE
 def fetch_twse_monthly(sid, year_month_str):
     url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={year_month_str}&stockNo={sid}"
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        headers = {'User-Agent': 'Mozilla/5.0'}
         r = requests.get(url, headers=headers, timeout=5)
         data = r.json()
         if data.get('stat') == 'OK':
@@ -137,24 +135,48 @@ def fetch_twse_monthly(sid, year_month_str):
                     date_str = f"{g_year}-{row[0].split('/')[1]}-{row[0].split('/')[2]}"
                     records.append({
                         'Date': pd.to_datetime(date_str),
-                        'Open': clean_number(row[3]),
-                        'High': clean_number(row[4]),
-                        'Low': clean_number(row[5]),
-                        'Close': clean_number(row[6])
+                        'Open': clean_number(row[3]), 'High': clean_number(row[4]),
+                        'Low': clean_number(row[5]), 'Close': clean_number(row[6])
                     })
                 except: continue
             if records:
                 df = pd.DataFrame(records).set_index('Date')
-                if hasattr(df.index, 'tz') and df.index.tz is not None:
-                    df.index = df.index.tz_localize(None)
                 df.index = pd.to_datetime(df.index).normalize()
                 return df
     except: pass
     return pd.DataFrame()
 
-# 【終極修正 V8】Yahoo Finance 混搭 TWSE 官方救援防漏接引擎
+# 【上櫃備援】TPEx (解決 00981A 真正問題的核心)
+def fetch_tpex_monthly(sid, year, month):
+    roc_year = year - 1911
+    month_str = f"{month:02d}"
+    url = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_year}/{month_str}&stkno={sid}"
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        r = requests.get(url, headers=headers, timeout=5)
+        data = r.json()
+        if 'aaData' in data and data['aaData']:
+            records = []
+            for row in data['aaData']:
+                try:
+                    d_parts = row[0].split('/')
+                    g_year = int(d_parts[0]) + 1911
+                    date_str = f"{g_year}-{d_parts[1]}-{d_parts[2]}"
+                    records.append({
+                        'Date': pd.to_datetime(date_str),
+                        'Open': clean_number(row[3]), 'High': clean_number(row[4]),
+                        'Low': clean_number(row[5]), 'Close': clean_number(row[6])
+                    })
+                except: continue
+            if records:
+                df = pd.DataFrame(records).set_index('Date')
+                df.index = pd.to_datetime(df.index).normalize()
+                return df
+    except: pass
+    return pd.DataFrame()
+
 @st.cache_data(ttl=3600)
-def fetch_stock_data_v8(sids, start_dt, end_dt):
+def fetch_stock_data_v9(sids, start_dt, end_dt):
     price_map = {}
     if not sids: return price_map
     
@@ -162,9 +184,7 @@ def fetch_stock_data_v8(sids, start_dt, end_dt):
         if df is None or df.empty: return None
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-            
         df = df.rename(columns=lambda x: str(x).capitalize() if str(x).lower() in ['close', 'open', 'high', 'low', 'volume'] else x)
-        
         if 'Close' in df.columns:
             df = df.dropna(subset=['Close'])
             if df.empty: return None
@@ -181,12 +201,11 @@ def fetch_stock_data_v8(sids, start_dt, end_dt):
     for sid in sids:
         df_combined = pd.DataFrame()
         
-        # 第一線：向 Yahoo Finance 索取
+        # 1. 嘗試 Yahoo Finance
         try:
             tkr_tw = yf.Ticker(f"{sid}.TW")
             raw_tw = tkr_tw.history(start=start_dt, end=end_dt)
-            if raw_tw is None or raw_tw.empty:
-                raw_tw = yf.download(f"{sid}.TW", start=start_dt, end=end_dt, progress=False)
+            if raw_tw is None or raw_tw.empty: raw_tw = yf.download(f"{sid}.TW", start=start_dt, end=end_dt, progress=False)
             cl_tw = clean_and_format_price_df(raw_tw)
             if cl_tw is not None: df_combined = cl_tw
         except: pass
@@ -194,41 +213,40 @@ def fetch_stock_data_v8(sids, start_dt, end_dt):
         try:
             tkr_two = yf.Ticker(f"{sid}.TWO")
             raw_two = tkr_two.history(start=start_dt, end=end_dt)
-            if raw_two is None or raw_two.empty:
-                raw_two = yf.download(f"{sid}.TWO", start=start_dt, end=end_dt, progress=False)
+            if raw_two is None or raw_two.empty: raw_two = yf.download(f"{sid}.TWO", start=start_dt, end=end_dt, progress=False)
             cl_two = clean_and_format_price_df(raw_two)
             if cl_two is not None:
                 df_combined = cl_two if df_combined.empty else df_combined.combine_first(cl_two)
         except: pass
         
-        # 第二線：TWSE 官方救援機制 (修補 YF 的資料黑洞)
+        # 2. 官方雙引擎備援 (TWSE + TPEx) 解決資料斷層
         clean_sid = str(sid).replace('.TW', '').replace('.TWO', '').strip()
         try:
             if df_combined.empty:
-                # 狀況A: YF 完全死掉，向 TWSE 抓取最近三個月
                 months = pd.date_range(start_dt.replace(day=1), end_dt, freq='MS')
                 for m in months[-3:]:
                     df_twse = fetch_twse_monthly(clean_sid, m.strftime('%Y%m01'))
-                    if not df_twse.empty:
-                        df_twse = df_twse[df_twse['Close'] > 0]
-                        df_combined = df_twse if df_combined.empty else df_combined.combine_first(df_twse)
-                    time.sleep(0.1)
+                    df_tpex = fetch_tpex_monthly(clean_sid, m.year, m.month)
+                    df_official = df_twse if not df_twse.empty else df_tpex
+                    if not df_official.empty:
+                        df_official = df_official[df_official['Close'] > 0]
+                        df_combined = df_official if df_combined.empty else df_combined.combine_first(df_official)
+                    time.sleep(0.3)
             else:
-                # 狀況B: 智慧偵測 YF 的資料斷層 (大於 10 天的破洞，例如 Jan 2 到 Feb 10)
                 df_combined = df_combined.sort_index()
                 gaps = df_combined.index.to_series().diff()
                 big_gaps = gaps[gaps > pd.Timedelta(days=10)]
-                
                 for gap_end in big_gaps.index:
                     gap_start = gap_end - gaps[gap_end]
-                    # 抓出這個斷層涵蓋的所有月份，向 TWSE 討回真實資料
                     gap_months = pd.date_range(gap_start.replace(day=1), gap_end, freq='MS')
                     for m in gap_months:
                         df_twse = fetch_twse_monthly(clean_sid, m.strftime('%Y%m01'))
-                        if not df_twse.empty:
-                            df_twse = df_twse[df_twse['Close'] > 0]
-                            df_combined = df_combined.combine_first(df_twse)
-                        time.sleep(0.1)
+                        df_tpex = fetch_tpex_monthly(clean_sid, m.year, m.month)
+                        df_official = df_twse if not df_twse.empty else df_tpex
+                        if not df_official.empty:
+                            df_official = df_official[df_official['Close'] > 0]
+                            df_combined = df_combined.combine_first(df_official)
+                        time.sleep(0.3)
         except: pass
 
         if not df_combined.empty:
@@ -303,8 +321,7 @@ def calculate_avg_cost_optimized(df_history, target_sid, price_df):
 
 def draw_analysis_chart(sid, name, df_history, unique_key_prefix):
     chart_start = datetime.now() - timedelta(days=365)
-    
-    price_map = fetch_stock_data_v8([sid], chart_start, datetime.now() + timedelta(days=1))
+    price_map = fetch_stock_data_v9([sid], chart_start, datetime.now() + timedelta(days=1))
     df_chart_price = price_map.get(sid, pd.DataFrame())
     
     if df_chart_price.empty:
@@ -323,39 +340,37 @@ def draw_analysis_chart(sid, name, df_history, unique_key_prefix):
         subplot_titles=(f"<b>{sid} {name} 股價與成本</b>", "<b>持股水位</b>", "<b>每日增減金額</b>")
     )
     
+    # 【游標修復】加入 customdata 綁定真實日期，並設定 hovertemplate
     fig.add_trace(go.Candlestick(
-        x=x_vals, 
-        open=df_chart_price['Open'].values, 
-        high=df_chart_price['High'].values,
-        low=df_chart_price['Low'].values, 
-        close=df_chart_price['Close'].values, 
-        name='股價',
-        increasing_line_color='red', decreasing_line_color='green'
+        x=x_vals, open=df_chart_price['Open'].values, high=df_chart_price['High'].values,
+        low=df_chart_price['Low'].values, close=df_chart_price['Close'].values, name='股價',
+        increasing_line_color='red', decreasing_line_color='green',
+        customdata=str_dates,
+        hovertemplate='日期: %{customdata}<br>開: %{open:.2f}<br>高: %{high:.2f}<br>低: %{low:.2f}<br>收: %{close:.2f}<extra></extra>'
     ), row=1, col=1)
     
     fig.add_trace(go.Scatter(
         x=x_vals, y=cost_line, mode='lines', 
-        line=dict(color='orange', width=2, dash='dot'), name='981成本'
+        line=dict(color='orange', width=2, dash='dot'), name='981成本',
+        customdata=str_dates, hovertemplate='日期: %{customdata}<br>成本: %{y:.2f}<extra></extra>'
     ), row=1, col=1)
     
     fig.add_trace(go.Scatter(
         x=x_vals, y=shares_series, mode='lines+markers',
-        fill='tozeroy', line=dict(color='blue'), name='持股數'
+        fill='tozeroy', line=dict(color='blue'), name='持股數',
+        customdata=str_dates, hovertemplate='日期: %{customdata}<br>持股數: %{y}<extra></extra>'
     ), row=2, col=1)
     
     colors = ['red' if x > 0 else 'green' for x in amounts]
     fig.add_trace(go.Bar(
-        x=x_vals, y=amounts, marker_color=colors, name='淨買賣額'
+        x=x_vals, y=amounts, marker_color=colors, name='淨買賣額',
+        customdata=str_dates, hovertemplate='日期: %{customdata}<br>淨買賣: %{y}<extra></extra>'
     ), row=3, col=1)
     
     fig.update_layout(height=800, xaxis_rangeslider_visible=False, template="plotly_white")
     
     tick_step = max(1, len(x_vals) // 10)
-    fig.update_xaxes(
-        tickmode='array',
-        tickvals=x_vals[::tick_step],
-        ticktext=str_dates[::tick_step]
-    )
+    fig.update_xaxes(tickmode='array', tickvals=x_vals[::tick_step], ticktext=str_dates[::tick_step])
     st.plotly_chart(fig, use_container_width=True, key=f"{unique_key_prefix}_chart_{sid}")
 
 @st.dialog("個股詳細分析", width="large")
@@ -376,7 +391,6 @@ if df_files.empty:
     st.stop()
 
 df_history_cache = get_all_holdings_history(df_files)
-
 latest_date_record = df_files.iloc[-1]['date']
 latest_path = df_files.iloc[-1]['path']
 st.sidebar.info(f"最新資料日期: {latest_date_record.strftime('%Y-%m-%d')}")
@@ -389,30 +403,23 @@ menu = st.sidebar.radio("功能選單", ["總覽 (Dashboard)", "每日持倉變�
 if menu == "總覽 (Dashboard)":
     st.header("📈 00981a 總覽")
     df_latest = parse_excel_holding(latest_path)
-
     col1, col2 = st.columns([2, 1])
     
     with col1:
         st.subheader("00981a 近一年走勢與現金權重")
         start_d = datetime.now() - timedelta(days=365)
         
-        # 呼叫 V8 引擎，配備 TWSE 官方斷層修補技術
-        etf_price_map = fetch_stock_data_v8(["00981A", "00981"], start_d, datetime.now() + timedelta(days=1))
-        
+        # 呼叫 V9 雙引擎
+        etf_price_map = fetch_stock_data_v9(["00981A", "00981"], start_d, datetime.now() + timedelta(days=1))
         df_etf_A = etf_price_map.get("00981A", pd.DataFrame())
         df_etf_B = etf_price_map.get("00981", pd.DataFrame())
         
-        if not df_etf_A.empty and not df_etf_B.empty:
-            df_etf = df_etf_A.combine_first(df_etf_B)
-        elif not df_etf_A.empty:
-            df_etf = df_etf_A
-        else:
-            df_etf = df_etf_B
+        if not df_etf_A.empty and not df_etf_B.empty: df_etf = df_etf_A.combine_first(df_etf_B)
+        elif not df_etf_A.empty: df_etf = df_etf_A
+        else: df_etf = df_etf_B
         
         if not df_etf.empty:
             df_cw = get_etf_cash_history(df_files)
-            
-            # 使用 left join，因為 df_etf 已經靠官方 API 找回了所有消失的實體 K 棒
             df_etf_comb = df_etf.join(df_cw, how='left')
             df_etf_comb['Cash_Weight'] = df_etf_comb['Cash_Weight'].ffill().fillna(0)
             df_etf_comb = df_etf_comb.dropna(subset=['Close'])
@@ -425,29 +432,24 @@ if menu == "總覽 (Dashboard)":
                 subplot_titles=("<b>00981a K線</b>", "<b>現金權重走勢 (%)</b>")
             )
             
+            # 【游標修復】Dashboard 主圖
             fig.add_trace(go.Candlestick(
-                x=x_vals, 
-                open=df_etf_comb['Open'].values, 
-                high=df_etf_comb['High'].values,
-                low=df_etf_comb['Low'].values, 
-                close=df_etf_comb['Close'].values, 
-                name='K線',
-                increasing_line_color='red', decreasing_line_color='green'
+                x=x_vals, open=df_etf_comb['Open'].values, high=df_etf_comb['High'].values,
+                low=df_etf_comb['Low'].values, close=df_etf_comb['Close'].values, name='K線',
+                increasing_line_color='red', decreasing_line_color='green',
+                customdata=str_dates,
+                hovertemplate='日期: %{customdata}<br>開: %{open:.2f}<br>高: %{high:.2f}<br>低: %{low:.2f}<br>收: %{close:.2f}<extra></extra>'
             ), row=1, col=1)
             
             fig.add_trace(go.Scatter(
                 x=x_vals, y=df_etf_comb['Cash_Weight'].values, mode='lines', 
-                line=dict(color='#17becf', width=2), fill='tozeroy', name='現金權重'
+                line=dict(color='#17becf', width=2), fill='tozeroy', name='現金權重',
+                customdata=str_dates, hovertemplate='日期: %{customdata}<br>現金權重: %{y:.2f}%<extra></extra>'
             ), row=2, col=1)
 
             fig.update_layout(height=500, xaxis_rangeslider_visible=False, margin=dict(l=20, r=20, t=20, b=20), template="plotly_white")
-            
             tick_step = max(1, len(x_vals) // 10)
-            fig.update_xaxes(
-                tickmode='array',
-                tickvals=x_vals[::tick_step],
-                ticktext=str_dates[::tick_step]
-            )
+            fig.update_xaxes(tickmode='array', tickvals=x_vals[::tick_step], ticktext=str_dates[::tick_step])
             
             st.plotly_chart(fig, use_container_width=True, key="dashboard_main_chart")
         else:
@@ -460,10 +462,7 @@ if menu == "總覽 (Dashboard)":
             df_show = df_sorted[['ID', 'Name', 'Shares_num', 'Weight_str']].rename(columns={
                 'ID': '股票代號', 'Name': '股票名稱', 'Shares_num': '持股數', 'Weight_str': '持股權重'
             })
-            st.dataframe(
-                df_show.style.format({'持股數': '{:,.0f}'}), 
-                use_container_width=True, height=400, hide_index=True, key="dashboard_weight_table"
-            )
+            st.dataframe(df_show.style.format({'持股數': '{:,.0f}'}), use_container_width=True, height=400, hide_index=True)
 
     st.divider()
     st.subheader("⚠️ 股價跌破 ETF 成本線")
@@ -475,33 +474,25 @@ if menu == "總覽 (Dashboard)":
         report_data = []
         sids = df_latest['ID'].tolist()
         
-        with st.spinner("正在計算成本分析... (已啟用快取引擎，速度飛快！)") :
-            price_map = fetch_stock_data_v8(sids, start_d, datetime.now() + timedelta(days=1))
+        with st.spinner("正在計算成本分析..."):
+            price_map = fetch_stock_data_v9(sids, start_d, datetime.now() + timedelta(days=1))
             
             for row in df_latest.itertuples():
                 sid, name = row.ID, row.Name
                 df_p = price_map.get(sid, pd.DataFrame())
-
                 if not df_p.empty:
                     _, cost_line, _, _ = calculate_avg_cost_optimized(df_history_cache, sid, df_p)
                     curr_price = df_p['Close'].iloc[-1]
                     curr_cost = cost_line[-1] if cost_line and cost_line[-1] is not None else 0
-                    
                     if curr_cost > 0:
                         diff_pct = (curr_price - curr_cost) / curr_cost * 100
                         if diff_pct < 0:
-                            report_data.append({
-                                "代號": sid, "名稱": name, "現價": round(curr_price, 2),
-                                "981成本": round(curr_cost, 2), "帳面損益": diff_pct
-                            })
+                            report_data.append({"代號": sid, "名稱": name, "現價": round(curr_price, 2), "981成本": round(curr_cost, 2), "帳面損益": diff_pct})
         
         df_underwater = pd.DataFrame(report_data)
-        
         if not df_underwater.empty:
             df_underwater = df_underwater.sort_values("帳面損益")
-            
             st.markdown("💡 **直接點擊【股票名稱按鈕】即可彈出 K 線圖與成本分析**")
-            
             cols = st.columns([1, 2, 1, 1, 1.5])
             cols[0].markdown("**股票代號**")
             cols[1].markdown("**股票名稱 (點擊看圖)**")
@@ -512,13 +503,10 @@ if menu == "總覽 (Dashboard)":
             for _, row in df_underwater.iterrows():
                 cols = st.columns([1, 2, 1, 1, 1.5])
                 cols[0].write(row['代號'])
-                
                 if cols[1].button(f"{row['名稱']}", key=f"btn_uw_{row['代號']}", use_container_width=True):
                     show_stock_dialog(row['代號'], row['名稱'], df_history_cache)
-                    
                 cols[2].write(f"{row['現價']:.2f}")
                 cols[3].write(f"{row['981成本']:.2f}")
-                
                 color = "green" if row['帳面損益'] < 0 else "red"
                 cols[4].markdown(f"<span style='color:{color}'>{row['帳面損益']:.2f}%</span>", unsafe_allow_html=True)
         else:
@@ -529,7 +517,6 @@ if menu == "總覽 (Dashboard)":
 # =========================================================
 elif menu == "每日持倉變化":
     st.header("📅 每日持倉變化")
-    
     col_date, _ = st.columns([1, 3])
     with col_date:
         pick_date = st.date_input("選擇日期", latest_date_record.date(), key="daily_date_picker")
@@ -537,14 +524,11 @@ elif menu == "每日持倉變化":
 
     curr_record = df_files[df_files['date'] == pick_date_ts]
     
-    if curr_record.empty:
-        st.warning(f"無 {pick_date} 資料。")
+    if curr_record.empty: st.warning(f"無 {pick_date} 資料。")
     else:
         curr_idx = curr_record.index[0]
         prev_idx = curr_idx - 1
-        
-        if prev_idx < 0:
-            st.warning("這是第一筆資料，無前一日可比較。")
+        if prev_idx < 0: st.warning("這是第一筆資料，無前一日可比較。")
         else:
             path_curr = curr_record.iloc[0]['path']
             path_prev = df_files.iloc[prev_idx]['path']
@@ -552,29 +536,22 @@ elif menu == "每日持倉變化":
             df_t = parse_excel_holding(path_curr)
             df_y = parse_excel_holding(path_prev)
             
-            m = pd.merge(df_y[['ID', 'Name', 'Shares_num']], 
-                         df_t[['ID', 'Name', 'Shares_num', 'Weight_str', 'Weight_num']], 
-                         on='ID', how='outer', suffixes=('_old', '_new'))
-            
+            m = pd.merge(df_y[['ID', 'Name', 'Shares_num']], df_t[['ID', 'Name', 'Shares_num', 'Weight_str', 'Weight_num']], on='ID', how='outer', suffixes=('_old', '_new'))
             m['Name'] = m['Name_new'].combine_first(m['Name_old']).fillna("未知")
             m = m.fillna(0)
             m['股數變化'] = m['Shares_num_new'] - m['Shares_num_old']
             
             df_change = m[(m['Shares_num_old'] != 0) | (m['Shares_num_new'] != 0)].copy()
-            
             sids_change = df_change[df_change['股數變化'] != 0]['ID'].tolist()
             price_map = {}
             if sids_change:
                 dl_start = pick_date_ts - timedelta(days=7) 
-                bulk_p_map = fetch_stock_data_v8(sids_change, dl_start, pick_date_ts + timedelta(days=1))
-                
+                bulk_p_map = fetch_stock_data_v9(sids_change, dl_start, pick_date_ts + timedelta(days=1))
                 for sid in sids_change:
                     s_data = bulk_p_map.get(sid, pd.DataFrame())
                     if not s_data.empty:
                         valid_p = s_data[s_data.index <= pick_date_ts]
-                        if not valid_p.empty:
-                            price_map[sid] = valid_p['Close'].iloc[-1]
-                        else: price_map[sid] = 0
+                        price_map[sid] = valid_p['Close'].iloc[-1] if not valid_p.empty else 0
                     else: price_map[sid] = 0
             
             df_change['Price'] = df_change['ID'].map(price_map).fillna(0)
@@ -587,41 +564,28 @@ elif menu == "每日持倉變化":
                 display_rows.append({
                     '股票代號': row['ID'], '股票名稱': row['Name'], '持股權重': row['Weight_str'],
                     '前股數': int(row['Shares_num_old']), '今股數': int(row['Shares_num_new']),
-                    '股數變化': int(row['股數變化']), '差額': diff_txt, 
-                    'Weight_num': row['Weight_num'], 
-                    'Is_Zero': int(row['Shares_num_new']) == 0
+                    '股數變化': int(row['股數變化']), '差額': diff_txt, 'Weight_num': row['Weight_num'], 'Is_Zero': int(row['Shares_num_new']) == 0
                 })
             
             df_display = pd.DataFrame(display_rows)
-            
             if not df_display.empty:
                 df_display = df_display.sort_values(by=['Is_Zero', 'Weight_num'], ascending=[True, False])
-                
                 st.subheader("📋 持股變化表")
                 st.dataframe(
                     df_display.drop(columns=['Weight_num', 'Is_Zero']).style.applymap(
-                        lambda v: 'color: red' if v > 0 else 'color: green' if v < 0 else '', 
-                        subset=['股數變化']
+                        lambda v: 'color: red' if v > 0 else 'color: green' if v < 0 else '', subset=['股數變化']
                     ).format({'前股數': '{:,}', '今股數': '{:,}', '股數變化': '{:,}'}),
-                    use_container_width=True, hide_index=True, key="daily_change_table"
+                    use_container_width=True, hide_index=True
                 )
-                
                 st.divider()
                 st.subheader("📈 變動個股技術分析")
                 
                 changed_stocks = df_display[df_display['股數變化'] != 0]
                 if not changed_stocks.empty:
-                    target_label = st.selectbox(
-                        "選擇有變動的股票:", 
-                        changed_stocks['股票代號'] + " " + changed_stocks['股票名稱'],
-                        key="daily_stock_selector"
-                    )
-                    
+                    target_label = st.selectbox("選擇有變動的股票:", changed_stocks['股票代號'] + " " + changed_stocks['股票名稱'])
                     if target_label:
                         tsid = target_label.split(" ")[0]
                         tname = target_label.split(" ")[1]
                         draw_analysis_chart(tsid, tname, df_history_cache, "daily")
-                else:
-                    st.info("當日無任何變動股可供繪圖。")
-            else:
-                st.info("該日持股無變化。")
+                else: st.info("當日無任何變動股可供繪圖。")
+            else: st.info("該日持股無變化。")
