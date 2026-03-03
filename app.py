@@ -104,7 +104,7 @@ def parse_excel_holding(path):
     return pd.DataFrame()
 
 # ---------------------------------------------------------
-# 2. 效能優化引擎 (終極防漏接 V6 引擎)
+# 2. 效能優化引擎 (終極防漏接 V7 引擎)
 # ---------------------------------------------------------
 
 @st.cache_data(ttl=3600)
@@ -119,9 +119,9 @@ def get_all_holdings_history(_df_files):
         return pd.concat(all_records, ignore_index=True)
     return pd.DataFrame()
 
-# 【終極修正 V6】捨棄 yf.download，全面切換為更穩定的 yf.Ticker().history API
+# 【終極修正 V7】確保快取完全洗淨
 @st.cache_data(ttl=3600)
-def fetch_stock_data_v6(sids, start_dt, end_dt):
+def fetch_stock_data_v7(sids, start_dt, end_dt):
     price_map = {}
     if not sids: return price_map
     
@@ -136,12 +136,10 @@ def fetch_stock_data_v6(sids, start_dt, end_dt):
             df = df.dropna(subset=['Close'])
             if df.empty: return None
             
-            # 確保 OHL 不為空，防禦繪圖失敗
             df['Open'] = df['Open'].fillna(df['Close'])
             df['High'] = df['High'].fillna(df['Close'])
             df['Low'] = df['Low'].fillna(df['Close'])
             
-            # 強制統一時間格式
             if hasattr(df.index, 'tz') and df.index.tz is not None:
                 df.index = df.index.tz_localize(None)
             df.index = pd.to_datetime(df.index).normalize()
@@ -152,11 +150,9 @@ def fetch_stock_data_v6(sids, start_dt, end_dt):
     for sid in sids:
         df_combined = pd.DataFrame()
         
-        # 1. 嘗試上市 (.TW) - 使用 yf.Ticker().history 繞過資料黑洞
         try:
             tkr_tw = yf.Ticker(f"{sid}.TW")
             raw_tw = tkr_tw.history(start=start_dt, end=end_dt)
-            # 雙重保險：如果 history 失敗，再退回 download 嘗試
             if raw_tw is None or raw_tw.empty:
                 raw_tw = yf.download(f"{sid}.TW", start=start_dt, end=end_dt, progress=False)
             cl_tw = clean_and_format_price_df(raw_tw)
@@ -164,7 +160,6 @@ def fetch_stock_data_v6(sids, start_dt, end_dt):
                 df_combined = cl_tw
         except: pass
             
-        # 2. 嘗試上櫃 (.TWO)
         try:
             tkr_two = yf.Ticker(f"{sid}.TWO")
             raw_two = tkr_two.history(start=start_dt, end=end_dt)
@@ -250,7 +245,7 @@ def calculate_avg_cost_optimized(df_history, target_sid, price_df):
 def draw_analysis_chart(sid, name, df_history, unique_key_prefix):
     chart_start = datetime.now() - timedelta(days=365)
     
-    price_map = fetch_stock_data_v6([sid], chart_start, datetime.now() + timedelta(days=1))
+    price_map = fetch_stock_data_v7([sid], chart_start, datetime.now() + timedelta(days=1))
     df_chart_price = price_map.get(sid, pd.DataFrame())
     
     if df_chart_price.empty:
@@ -259,6 +254,9 @@ def draw_analysis_chart(sid, name, df_history, unique_key_prefix):
 
     dates, cost_line, shares_series, diff_series = calculate_avg_cost_optimized(df_history, sid, df_chart_price)
     amounts = diff_series * df_chart_price['Close'].values
+    
+    # 【根因解決】產生連續的整數索引來強制接合 K 棒，完全杜絕 Plotly 撐開空白斷層
+    x_vals = np.arange(len(dates))
     str_dates = dates.strftime('%Y-%m-%d')
 
     fig = make_subplots(
@@ -268,28 +266,40 @@ def draw_analysis_chart(sid, name, df_history, unique_key_prefix):
     )
     
     fig.add_trace(go.Candlestick(
-        x=str_dates, open=df_chart_price['Open'], high=df_chart_price['High'],
-        low=df_chart_price['Low'], close=df_chart_price['Close'], name='股價',
+        x=x_vals, 
+        open=df_chart_price['Open'].values, 
+        high=df_chart_price['High'].values,
+        low=df_chart_price['Low'].values, 
+        close=df_chart_price['Close'].values, 
+        name='股價',
         increasing_line_color='red', decreasing_line_color='green'
     ), row=1, col=1)
     
     fig.add_trace(go.Scatter(
-        x=str_dates, y=cost_line, mode='lines', 
+        x=x_vals, y=cost_line, mode='lines', 
         line=dict(color='orange', width=2, dash='dot'), name='981成本'
     ), row=1, col=1)
     
     fig.add_trace(go.Scatter(
-        x=str_dates, y=shares_series, mode='lines+markers',
+        x=x_vals, y=shares_series, mode='lines+markers',
         fill='tozeroy', line=dict(color='blue'), name='持股數'
     ), row=2, col=1)
     
     colors = ['red' if x > 0 else 'green' for x in amounts]
     fig.add_trace(go.Bar(
-        x=str_dates, y=amounts, marker_color=colors, name='淨買賣額'
+        x=x_vals, y=amounts, marker_color=colors, name='淨買賣額'
     ), row=3, col=1)
     
     fig.update_layout(height=800, xaxis_rangeslider_visible=False, template="plotly_white")
-    fig.update_xaxes(type='category', nticks=10) 
+    
+    # 將整數 X 軸重新貼回真實的日期標籤
+    tick_step = max(1, len(x_vals) // 10)
+    fig.update_xaxes(
+        tickmode='array',
+        tickvals=x_vals[::tick_step],
+        ticktext=str_dates[::tick_step]
+    )
+    
     st.plotly_chart(fig, use_container_width=True, key=f"{unique_key_prefix}_chart_{sid}")
 
 @st.dialog("個股詳細分析", width="large")
@@ -330,8 +340,7 @@ if menu == "總覽 (Dashboard)":
         st.subheader("00981a 近一年走勢與現金權重")
         start_d = datetime.now() - timedelta(days=365)
         
-        # 呼叫 V6 引擎，直搗 YF Ticker API 討回被吞掉的資料
-        etf_price_map = fetch_stock_data_v6(["00981A", "00981"], start_d, datetime.now() + timedelta(days=1))
+        etf_price_map = fetch_stock_data_v7(["00981A", "00981"], start_d, datetime.now() + timedelta(days=1))
         
         df_etf_A = etf_price_map.get("00981A", pd.DataFrame())
         df_etf_B = etf_price_map.get("00981", pd.DataFrame())
@@ -346,13 +355,13 @@ if menu == "總覽 (Dashboard)":
         if not df_etf.empty:
             df_cw = get_etf_cash_history(df_files)
             
-            # 使用 left join 確保只顯示有真實 K 棒的交易日，完美避開假日假線
             df_etf_comb = df_etf.join(df_cw, how='left')
             df_etf_comb['Cash_Weight'] = df_etf_comb['Cash_Weight'].ffill().fillna(0)
             
-            # 確保剔除任何無收盤價的髒資料
             df_etf_comb = df_etf_comb.dropna(subset=['Close'])
             
+            # 【根因解決】產生連續的整數索引來強制接合 K 棒，拒絕 Plotly 創造物理斷層
+            x_vals = np.arange(len(df_etf_comb))
             str_dates = df_etf_comb.index.strftime('%Y-%m-%d')
 
             fig = make_subplots(
@@ -361,18 +370,30 @@ if menu == "總覽 (Dashboard)":
             )
             
             fig.add_trace(go.Candlestick(
-                x=str_dates, open=df_etf_comb['Open'], high=df_etf_comb['High'],
-                low=df_etf_comb['Low'], close=df_etf_comb['Close'], name='K線',
+                x=x_vals, 
+                open=df_etf_comb['Open'].values, 
+                high=df_etf_comb['High'].values,
+                low=df_etf_comb['Low'].values, 
+                close=df_etf_comb['Close'].values, 
+                name='K線',
                 increasing_line_color='red', decreasing_line_color='green'
             ), row=1, col=1)
             
             fig.add_trace(go.Scatter(
-                x=str_dates, y=df_etf_comb['Cash_Weight'], mode='lines', 
+                x=x_vals, y=df_etf_comb['Cash_Weight'].values, mode='lines', 
                 line=dict(color='#17becf', width=2), fill='tozeroy', name='現金權重'
             ), row=2, col=1)
 
             fig.update_layout(height=500, xaxis_rangeslider_visible=False, margin=dict(l=20, r=20, t=20, b=20), template="plotly_white")
-            fig.update_xaxes(type='category', nticks=10)
+            
+            # 將整數 X 軸重新貼回真實的日期標籤
+            tick_step = max(1, len(x_vals) // 10)
+            fig.update_xaxes(
+                tickmode='array',
+                tickvals=x_vals[::tick_step],
+                ticktext=str_dates[::tick_step]
+            )
+            
             st.plotly_chart(fig, use_container_width=True, key="dashboard_main_chart")
         else:
             st.warning("無法取得 00981A 資料。")
@@ -400,7 +421,7 @@ if menu == "總覽 (Dashboard)":
         sids = df_latest['ID'].tolist()
         
         with st.spinner("正在計算成本分析... (已啟用快取引擎，速度飛快！)"):
-            price_map = fetch_stock_data_v6(sids, start_d, datetime.now() + timedelta(days=1))
+            price_map = fetch_stock_data_v7(sids, start_d, datetime.now() + timedelta(days=1))
             
             for row in df_latest.itertuples():
                 sid, name = row.ID, row.Name
@@ -490,7 +511,7 @@ elif menu == "每日持倉變化":
             price_map = {}
             if sids_change:
                 dl_start = pick_date_ts - timedelta(days=7) 
-                bulk_p_map = fetch_stock_data_v6(sids_change, dl_start, pick_date_ts + timedelta(days=1))
+                bulk_p_map = fetch_stock_data_v7(sids_change, dl_start, pick_date_ts + timedelta(days=1))
                 
                 for sid in sids_change:
                     s_data = bulk_p_map.get(sid, pd.DataFrame())
