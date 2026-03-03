@@ -122,7 +122,7 @@ def get_all_holdings_history(_df_files):
 
 @st.cache_data(ttl=3600)
 def get_bulk_prices(sids, start_dt, end_dt):
-    """取得股價並解決 MultiIndex 及時區問題"""
+    """取得股價並徹底解決 MultiIndex 及時區偏移導致的斷層問題"""
     price_map = {}
     missing = []
     
@@ -132,6 +132,18 @@ def get_bulk_prices(sids, start_dt, end_dt):
     def normalize_columns(df):
         return df.rename(columns=lambda x: str(x).capitalize() if str(x).lower() in ['close', 'open', 'high', 'low', 'volume'] else x)
         
+    def clean_and_format_price_df(s_data):
+        s_data = normalize_columns(s_data)
+        if 'Close' in s_data.columns:
+            s_data = s_data.dropna(subset=['Close'])
+            # 強制移除所有時區資訊，並歸零到午夜，避免 Join 失敗產生斷層
+            if hasattr(s_data.index, 'tz') and s_data.index.tz is not None:
+                s_data.index = s_data.index.tz_localize(None)
+            s_data.index = pd.to_datetime(s_data.index).normalize()
+            s_data = s_data[~s_data.index.duplicated(keep='last')]
+            if not s_data.empty: return s_data
+        return None
+
     try:
         df_tw = yf.download(tickers_tw, start=start_dt, end=end_dt, progress=False, auto_adjust=True)
         for sid in sids:
@@ -146,18 +158,9 @@ def get_bulk_prices(sids, start_dt, end_dt):
                 else:
                     s_data = df_tw.copy()
                     
-                s_data = normalize_columns(s_data)
-                
-                if 'Close' in s_data.columns:
-                    s_data = s_data.dropna(subset=['Close'])
-                    # 【修正1】強制移除時區，避免與 Excel 日期合併時產生斷層
-                    if hasattr(s_data.index, 'tz') and s_data.index.tz is not None:
-                        s_data.index = s_data.index.tz_localize(None)
-                    
-                    if not s_data.empty: price_map[sid] = s_data
-                    else: missing.append(sid)
-                else:
-                    missing.append(sid)
+                cleaned_df = clean_and_format_price_df(s_data)
+                if cleaned_df is not None: price_map[sid] = cleaned_df
+                else: missing.append(sid)
             except: missing.append(sid)
     except: missing = sids.copy()
     
@@ -171,20 +174,12 @@ def get_bulk_prices(sids, start_dt, end_dt):
                     if isinstance(df_two.columns, pd.MultiIndex):
                         if ticker in df_two.columns.get_level_values(1):
                             s_data = df_two.xs(ticker, level=1, axis=1).copy()
-                        else:
-                            continue
+                        else: continue
                     else:
                         s_data = df_two.copy()
                         
-                    s_data = normalize_columns(s_data)
-                    
-                    if 'Close' in s_data.columns:
-                        s_data = s_data.dropna(subset=['Close'])
-                        # 【修正1】強制移除時區
-                        if hasattr(s_data.index, 'tz') and s_data.index.tz is not None:
-                            s_data.index = s_data.index.tz_localize(None)
-                        
-                        if not s_data.empty: price_map[sid] = s_data
+                    cleaned_df = clean_and_format_price_df(s_data)
+                    if cleaned_df is not None: price_map[sid] = cleaned_df
                 except: pass
         except: pass
         
@@ -214,7 +209,8 @@ def extract_cash_weight(path):
 def get_etf_cash_history(_df_files):
     history = []
     for _, row in _df_files.iterrows():
-        history.append({'Date': row['date'], 'Cash_Weight': extract_cash_weight(row['path'])})
+        # 同樣確保日期精確在午夜，以利後續 Join
+        history.append({'Date': pd.to_datetime(row['date']).normalize(), 'Cash_Weight': extract_cash_weight(row['path'])})
     return pd.DataFrame(history).set_index('Date')
 
 # ---------------------------------------------------------
@@ -275,7 +271,7 @@ def draw_analysis_chart(sid, name, df_history, unique_key_prefix):
         subplot_titles=(f"<b>{sid} {name} 股價與成本</b>", "<b>持股水位</b>", "<b>每日增減金額</b>")
     )
     
-    # 【修正2】自訂 K 棒顏色為紅漲綠跌
+    # 【修正2】紅漲綠跌
     fig.add_trace(go.Candlestick(
         x=str_dates, open=df_chart_price['Open'], high=df_chart_price['High'],
         low=df_chart_price['Low'], close=df_chart_price['Close'], name='股價',
@@ -340,7 +336,17 @@ if menu == "總覽 (Dashboard)":
         start_d = datetime.now() - timedelta(days=365)
         
         etf_price_map = get_bulk_prices(["00981A", "00981"], start_d, datetime.now() + timedelta(days=1))
-        df_etf = etf_price_map.get("00981A", etf_price_map.get("00981", pd.DataFrame()))
+        
+        # 【修正1】完美拼接 00981A 與 00981 的資料，避免任何更名導致的日期斷層
+        df_etf_A = etf_price_map.get("00981A", pd.DataFrame())
+        df_etf_B = etf_price_map.get("00981", pd.DataFrame())
+        
+        if not df_etf_A.empty and not df_etf_B.empty:
+            df_etf = df_etf_A.combine_first(df_etf_B)
+        elif not df_etf_A.empty:
+            df_etf = df_etf_A
+        else:
+            df_etf = df_etf_B
         
         if not df_etf.empty:
             df_cw = get_etf_cash_history(df_files)
@@ -354,7 +360,7 @@ if menu == "總覽 (Dashboard)":
                 subplot_titles=("<b>00981a K線</b>", "<b>現金權重走勢 (%)</b>")
             )
             
-            # 【修正2】自訂 K 棒顏色為紅漲綠跌
+            # 【修正2】紅漲綠跌
             fig.add_trace(go.Candlestick(
                 x=str_dates, open=df_etf_comb['Open'], high=df_etf_comb['High'],
                 low=df_etf_comb['Low'], close=df_etf_comb['Close'], name='K線',
