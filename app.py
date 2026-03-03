@@ -109,7 +109,7 @@ def parse_excel_holding(path):
 
 @st.cache_data(ttl=3600)
 def get_all_holdings_history(_df_files):
-    """【效能優化】一次性解析所有 Excel 並建立歷史持股快取"""
+    """一次性解析所有 Excel 並建立歷史持股快取"""
     all_records = []
     for _, row in _df_files.iterrows():
         df_step = parse_excel_holding(row['path'])
@@ -122,46 +122,63 @@ def get_all_holdings_history(_df_files):
 
 @st.cache_data(ttl=3600)
 def get_bulk_prices(sids, start_dt, end_dt):
-    """【容錯優化】雙重抓取：先抓上市，失敗再抓上櫃，並解決單檔股票 MultiIndex 錯誤"""
+    """【修正核心】完美解決單一與多檔股票 MultiIndex 錯誤"""
     price_map = {}
     missing = []
     
     if not sids: return price_map
     tickers_tw = [f"{sid}.TW" for sid in sids]
     
+    def normalize_columns(df):
+        # 統一將小寫的 close, open 轉為大寫，確保後續擷取安全
+        return df.rename(columns=lambda x: str(x).capitalize() if str(x).lower() in ['close', 'open', 'high', 'low', 'volume'] else x)
+        
     try:
-        df_tw = yf.download(tickers_tw, start=start_dt, end=end_dt, group_by='ticker', progress=False, auto_adjust=True)
+        # 移除 group_by='ticker'，讓預設的 MultiIndex 機制處理
+        df_tw = yf.download(tickers_tw, start=start_dt, end=end_dt, progress=False, auto_adjust=True)
         for sid in sids:
+            ticker = f"{sid}.TW"
             try:
-                # 解決單一股票回傳 MultiIndex 導致 KeyError 的問題
-                if len(sids) > 1:
-                    s_data = df_tw[f"{sid}.TW"]
+                if isinstance(df_tw.columns, pd.MultiIndex):
+                    if ticker in df_tw.columns.get_level_values(1):
+                        s_data = df_tw.xs(ticker, level=1, axis=1).copy()
+                    else:
+                        missing.append(sid)
+                        continue
                 else:
-                    s_data = df_tw
-                    if isinstance(s_data.columns, pd.MultiIndex):
-                        s_data.columns = s_data.columns.get_level_values(0)
-                        
-                s_data = s_data.dropna()
-                if not s_data.empty: price_map[sid] = s_data
-                else: missing.append(sid)
+                    s_data = df_tw.copy()
+                    
+                s_data = normalize_columns(s_data)
+                
+                if 'Close' in s_data.columns:
+                    s_data = s_data.dropna(subset=['Close'])
+                    if not s_data.empty: price_map[sid] = s_data
+                    else: missing.append(sid)
+                else:
+                    missing.append(sid)
             except: missing.append(sid)
     except: missing = sids.copy()
     
     if missing:
         tickers_two = [f"{sid}.TWO" for sid in missing]
         try:
-            df_two = yf.download(tickers_two, start=start_dt, end=end_dt, group_by='ticker', progress=False, auto_adjust=True)
+            df_two = yf.download(tickers_two, start=start_dt, end=end_dt, progress=False, auto_adjust=True)
             for sid in missing:
+                ticker = f"{sid}.TWO"
                 try:
-                    if len(missing) > 1:
-                        s_data = df_two[f"{sid}.TWO"]
+                    if isinstance(df_two.columns, pd.MultiIndex):
+                        if ticker in df_two.columns.get_level_values(1):
+                            s_data = df_two.xs(ticker, level=1, axis=1).copy()
+                        else:
+                            continue
                     else:
-                        s_data = df_two
-                        if isinstance(s_data.columns, pd.MultiIndex):
-                            s_data.columns = s_data.columns.get_level_values(0)
-                            
-                    s_data = s_data.dropna()
-                    if not s_data.empty: price_map[sid] = s_data
+                        s_data = df_two.copy()
+                        
+                    s_data = normalize_columns(s_data)
+                    
+                    if 'Close' in s_data.columns:
+                        s_data = s_data.dropna(subset=['Close'])
+                        if not s_data.empty: price_map[sid] = s_data
                 except: pass
         except: pass
         
