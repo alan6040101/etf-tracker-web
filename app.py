@@ -380,6 +380,13 @@ def show_stock_dialog(sid, name, df_history):
 
 st.title("📊 00981a ETF 追蹤器")
 
+# =========================================================
+# 新增：網頁一載入 (F5 重整) 就自動清除 GitHub 快取
+# =========================================================
+if "page_loaded" not in st.session_state:
+    sync_data_repo.clear()
+    st.session_state["page_loaded"] = True
+
 with st.spinner('正在同步資料庫...'):
     df_files = sync_data_repo()
 
@@ -392,18 +399,7 @@ df_history_cache = get_all_holdings_history(df_files)
 latest_date_record = df_files.iloc[-1]['date']
 latest_path = df_files.iloc[-1]['path']
 
-# =========================================================
-# 新增：側邊欄加入「強制同步」按鈕，解決快取未更新的問題
-# =========================================================
 st.sidebar.info(f"最新資料日期: {latest_date_record.strftime('%Y-%m-%d')}")
-
-if st.sidebar.button("🔄 強制同步最新資料", use_container_width=True):
-    # 清除所有裝飾了 @st.cache_data 的函式快取
-    sync_data_repo.clear()
-    get_all_holdings_history.clear()
-    get_bulk_prices.clear()
-    get_etf_cash_history.clear()
-    st.rerun() # 重新整理頁面以抓取最新資料
 
 menu = st.sidebar.radio("功能選單", ["總覽 (Dashboard)", "每日持倉變化"])
 
