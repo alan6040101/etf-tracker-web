@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import requests
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
@@ -154,7 +155,7 @@ def parse_excel_holding(path):
     return pd.DataFrame()
 
 # ---------------------------------------------------------
-# 2. 效能優化引擎 (快取歷史持股與無縫股價拼接)
+# 2. 效能優化引擎 (引入 FinMind 備援與無縫股價拼接)
 # ---------------------------------------------------------
 
 @st.cache_data(ttl=3600)
@@ -167,6 +168,34 @@ def get_all_holdings_history(_df_files):
             all_records.append(df_step[['Date', 'ID', 'Shares_num']])
     if all_records:
         return pd.concat(all_records, ignore_index=True)
+    return pd.DataFrame()
+
+def fetch_finmind_price(sid, start_dt, end_dt):
+    """直接呼叫 FinMind 抓取台股真實資料，解決 yfinance 斷層問題"""
+    sid_str = str(sid).replace('.TW', '').replace('.TWO', '').strip()
+    url = "https://api.finmindtrade.com/api/v4/data"
+    params = {
+        "dataset": "TaiwanStockPrice",
+        "data_id": sid_str,
+        "start_date": start_dt.strftime("%Y-%m-%d"),
+        "end_date": end_dt.strftime("%Y-%m-%d")
+    }
+    try:
+        res = requests.get(url, params=params, timeout=10)
+        data = res.json()
+        if data.get('msg') == 'success' and 'data' in data and len(data['data']) > 0:
+            df = pd.DataFrame(data['data'])
+            df = df.rename(columns={
+                'date': 'Date', 'open': 'Open', 'max': 'High', 
+                'min': 'Low', 'close': 'Close', 'Trading_Volume': 'Volume'
+            })
+            df['Date'] = pd.to_datetime(df['Date'])
+            df = df.set_index('Date')
+            for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            return df[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+    except Exception as e:
+        pass
     return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
@@ -207,12 +236,26 @@ def get_bulk_prices(sids, start_dt, end_dt):
         cleaned_tw = clean_and_format_price_df(s_tw)
         cleaned_two = clean_and_format_price_df(s_two)
         
+        combined = None
         if cleaned_tw is not None and cleaned_two is not None:
-            price_map[sid] = cleaned_tw.combine_first(cleaned_two)
+            combined = cleaned_tw.combine_first(cleaned_two)
         elif cleaned_tw is not None:
-            price_map[sid] = cleaned_tw
+            combined = cleaned_tw
         elif cleaned_two is not None:
-            price_map[sid] = cleaned_two
+            combined = cleaned_two
+            
+        # 啟動 FinMind 備援：針對 00981a 或 Yfinance 抓出大缺口的股票
+        if combined is None or combined.empty or len(combined) < 20 or "00981" in str(sid):
+            fm_df = fetch_finmind_price(sid, start_dt, end_dt)
+            if not fm_df.empty:
+                if combined is None or combined.empty:
+                    combined = fm_df
+                else:
+                    # 使用 FinMind 資料完美填補 yfinance 的缺口
+                    combined = fm_df.combine_first(combined)
+
+        if combined is not None and not combined.empty:
+            price_map[sid] = combined
 
     return price_map
 
@@ -244,7 +287,7 @@ def get_etf_cash_history(_df_files):
     return pd.DataFrame(history).set_index('Date')
 
 # ---------------------------------------------------------
-# 3. 核心邏輯與繪圖 (已修補K線斷層與恢復字串Hover)
+# 3. 核心邏輯與繪圖 (移除填補機制，恢復原汁原味的 K線與日期)
 # ---------------------------------------------------------
 
 def calculate_avg_cost_optimized(df_stock, target_sid, price_df, is_grouped=False):
@@ -293,25 +336,11 @@ def draw_analysis_chart(sid, name, df_history, unique_key_prefix):
         st.error(f"無法取得 {sid} {name} 的股價資料")
         return
 
-    # 【斷層修補機制】：利用歷史操作資料庫的日期作為依據，填補 yfinance 遺漏的 K 棒
-    valid_spine = pd.DataFrame(index=df_history['Date'].unique()).sort_index()
-    combined_idx = df_chart_price.index.union(valid_spine.index).sort_values()
-    # 限制在股價原本的時間範圍內
-    mask = combined_idx >= df_chart_price.index.min()
-    combined_idx = combined_idx[mask]
-    
-    df_chart_price = pd.DataFrame(index=combined_idx).join(df_chart_price, how='left')
-    df_chart_price['Close'] = df_chart_price['Close'].ffill()
-    df_chart_price['Open'] = df_chart_price['Open'].fillna(df_chart_price['Close'])
-    df_chart_price['High'] = df_chart_price['High'].fillna(df_chart_price['Close'])
-    df_chart_price['Low'] = df_chart_price['Low'].fillna(df_chart_price['Close'])
-    df_chart_price = df_chart_price.dropna(subset=['Close'])
-
     dates, cost_line, shares_series, diff_series = calculate_avg_cost_optimized(df_history, sid, df_chart_price, is_grouped=False)
     amounts = diff_series * df_chart_price['Close'].values
     
-    # 恢復原本的字串格式，適配 Category X 軸與原始 Hover 顯示
-    str_dates = dates.strftime('%Y-%m-%d')
+    # 強制將日期轉為字串格式，讓 Hover 完全恢復原本的顯示風格
+    str_dates = df_chart_price.index.strftime('%Y-%m-%d')
 
     fig = make_subplots(
         rows=3, cols=1, shared_xaxes=True, 
@@ -342,7 +371,7 @@ def draw_analysis_chart(sid, name, df_history, unique_key_prefix):
     ), row=3, col=1)
     
     fig.update_layout(**tv_layout, height=800, xaxis_rangeslider_visible=False)
-    fig.update_xaxes(type='category', nticks=10) # 恢復 Category 隱藏假日
+    fig.update_xaxes(type='category', nticks=10) # 搭配字串陣列，完美跳過假日
     st.plotly_chart(fig, use_container_width=True, key=f"{unique_key_prefix}_chart_{sid}")
 
 @st.dialog("個股詳細分析", width="large")
@@ -390,23 +419,10 @@ if menu == "總覽 (Dashboard)":
         
         if not df_etf.empty:
             df_cw = get_etf_cash_history(df_files)
-            
-            # 【斷層修補機制】：確保 Yfinance 漏抓的開盤日依然能在畫面上呈現
-            combined_index = df_etf.index.union(df_cw.index).sort_values()
-            mask = combined_index >= df_etf.index.min()
-            combined_index = combined_index[mask]
-            
-            df_etf_patched = pd.DataFrame(index=combined_index).join(df_etf, how='left')
-            df_etf_patched['Close'] = df_etf_patched['Close'].ffill()
-            df_etf_patched['Open'] = df_etf_patched['Open'].fillna(df_etf_patched['Close'])
-            df_etf_patched['High'] = df_etf_patched['High'].fillna(df_etf_patched['Close'])
-            df_etf_patched['Low'] = df_etf_patched['Low'].fillna(df_etf_patched['Close'])
-            
-            df_etf_comb = df_etf_patched.join(df_cw, how='left')
+            df_etf_comb = df_etf.join(df_cw, how='left')
             df_etf_comb['Cash_Weight'] = df_etf_comb['Cash_Weight'].ffill().fillna(0)
-            df_etf_comb = df_etf_comb.dropna(subset=['Close'])
             
-            # 恢復字串格式
+            # 確保乾淨無斷層的資料進入圖表，並轉為字串格式恢復 Hover
             str_dates = df_etf_comb.index.strftime('%Y-%m-%d')
 
             fig = make_subplots(
