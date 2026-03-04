@@ -171,7 +171,6 @@ def get_all_holdings_history(_df_files):
 
 @st.cache_data(ttl=3600)
 def get_bulk_prices(sids, start_dt, end_dt):
-    """【終極修正版】雙向平行下載並無縫拼接 .TW 與 .TWO，解決斷層問題"""
     price_map = {}
     if not sids: return price_map
     
@@ -198,7 +197,6 @@ def get_bulk_prices(sids, start_dt, end_dt):
             return pd.DataFrame()
         return df_all.copy()
 
-    # 平行下載兩種市場的可能性
     df_tw = yf.download(tickers_tw, start=start_dt, end=end_dt, progress=False, auto_adjust=True)
     df_two = yf.download(tickers_two, start=start_dt, end=end_dt, progress=False, auto_adjust=True)
     
@@ -209,7 +207,6 @@ def get_bulk_prices(sids, start_dt, end_dt):
         cleaned_tw = clean_and_format_price_df(s_tw)
         cleaned_two = clean_and_format_price_df(s_two)
         
-        # 完美拼接：如果轉板了，兩段歷史會被組合在一起，絕不漏接
         if cleaned_tw is not None and cleaned_two is not None:
             price_map[sid] = cleaned_tw.combine_first(cleaned_two)
         elif cleaned_tw is not None:
@@ -247,13 +244,12 @@ def get_etf_cash_history(_df_files):
     return pd.DataFrame(history).set_index('Date')
 
 # ---------------------------------------------------------
-# 3. 核心邏輯與繪圖 (已優化效能與 K線日期顯示)
+# 3. 核心邏輯與繪圖 (已修補K線斷層與恢復字串Hover)
 # ---------------------------------------------------------
 
 def calculate_avg_cost_optimized(df_stock, target_sid, price_df, is_grouped=False):
     if price_df.empty or df_stock.empty: return [], [], [], []
     
-    # 若已在外部 groupby，則不需再次 filter 提升極速效能
     if not is_grouped:
         df_stock = df_stock[df_stock['ID'] == str(target_sid)]
         
@@ -297,12 +293,25 @@ def draw_analysis_chart(sid, name, df_history, unique_key_prefix):
         st.error(f"無法取得 {sid} {name} 的股價資料")
         return
 
+    # 【斷層修補機制】：利用歷史操作資料庫的日期作為依據，填補 yfinance 遺漏的 K 棒
+    valid_spine = pd.DataFrame(index=df_history['Date'].unique()).sort_index()
+    combined_idx = df_chart_price.index.union(valid_spine.index).sort_values()
+    # 限制在股價原本的時間範圍內
+    mask = combined_idx >= df_chart_price.index.min()
+    combined_idx = combined_idx[mask]
+    
+    df_chart_price = pd.DataFrame(index=combined_idx).join(df_chart_price, how='left')
+    df_chart_price['Close'] = df_chart_price['Close'].ffill()
+    df_chart_price['Open'] = df_chart_price['Open'].fillna(df_chart_price['Close'])
+    df_chart_price['High'] = df_chart_price['High'].fillna(df_chart_price['Close'])
+    df_chart_price['Low'] = df_chart_price['Low'].fillna(df_chart_price['Close'])
+    df_chart_price = df_chart_price.dropna(subset=['Close'])
+
     dates, cost_line, shares_series, diff_series = calculate_avg_cost_optimized(df_history, sid, df_chart_price, is_grouped=False)
     amounts = diff_series * df_chart_price['Close'].values
     
-    # 完美隱藏未開盤日，且保留 Hover 日期功能
-    dt_all = pd.date_range(start=dates.min(), end=dates.max())
-    dt_breaks = [d.strftime("%Y-%m-%d") for d in dt_all if d not in dates]
+    # 恢復原本的字串格式，適配 Category X 軸與原始 Hover 顯示
+    str_dates = dates.strftime('%Y-%m-%d')
 
     fig = make_subplots(
         rows=3, cols=1, shared_xaxes=True, 
@@ -310,32 +319,30 @@ def draw_analysis_chart(sid, name, df_history, unique_key_prefix):
         subplot_titles=(f"<b>{sid} {name} 股價與成本</b>", "<b>持股水位</b>", "<b>每日增減金額</b>")
     )
     
-    # K線：傳入真實 DatetimeIndex
     fig.add_trace(go.Candlestick(
-        x=dates, open=df_chart_price['Open'], high=df_chart_price['High'],
+        x=str_dates, open=df_chart_price['Open'], high=df_chart_price['High'],
         low=df_chart_price['Low'], close=df_chart_price['Close'], name='股價',
         increasing_line_color='#EF5350', increasing_fillcolor='#EF5350',
         decreasing_line_color='#26A69A', decreasing_fillcolor='#26A69A'
     ), row=1, col=1)
     
     fig.add_trace(go.Scatter(
-        x=dates, y=cost_line, mode='lines', 
-        line=dict(color='#FCCA46', width=2, dash='dot'), name='981成本'
+        x=str_dates, y=cost_line, mode='lines', 
+        line=dict(color='#FCCA46', width=2, dash='dot'), name='成本線'
     ), row=1, col=1)
     
     fig.add_trace(go.Scatter(
-        x=dates, y=shares_series, mode='lines+markers',
+        x=str_dates, y=shares_series, mode='lines+markers',
         fill='tozeroy', line=dict(color='#2962FF', width=2), fillcolor='rgba(41, 98, 255, 0.1)', name='持股數'
     ), row=2, col=1)
     
     colors = ['#EF5350' if x > 0 else '#26A69A' for x in amounts]
     fig.add_trace(go.Bar(
-        x=dates, y=amounts, marker_color=colors, name='淨買賣額'
+        x=str_dates, y=amounts, marker_color=colors, name='淨買賣額'
     ), row=3, col=1)
     
     fig.update_layout(**tv_layout, height=800, xaxis_rangeslider_visible=False)
-    # 使用 type='date' 配合 rangebreaks 達成隱藏假日
-    fig.update_xaxes(type='date', rangebreaks=[dict(values=dt_breaks)], nticks=10) 
+    fig.update_xaxes(type='category', nticks=10) # 恢復 Category 隱藏假日
     st.plotly_chart(fig, use_container_width=True, key=f"{unique_key_prefix}_chart_{sid}")
 
 @st.dialog("個股詳細分析", width="large")
@@ -376,18 +383,31 @@ if menu == "總覽 (Dashboard)":
         st.subheader("00981a 近一年走勢與現金權重")
         start_d = datetime.now() - timedelta(days=365)
         
-        # 精準只抓 00981A，避免 yfinance 合併多標的時產生的 NaN 斷層
-        etf_price_map = get_bulk_prices(["00981A"], start_d, datetime.now() + timedelta(days=1))
-        df_etf = etf_price_map.get("00981A", pd.DataFrame())
+        etf_price_map = get_bulk_prices(["00981A", "00981"], start_d, datetime.now() + timedelta(days=1))
+        df_etf_A = etf_price_map.get("00981A", pd.DataFrame())
+        df_etf_B = etf_price_map.get("00981", pd.DataFrame())
+        df_etf = df_etf_A.combine_first(df_etf_B) if not df_etf_A.empty else df_etf_B
         
         if not df_etf.empty:
             df_cw = get_etf_cash_history(df_files)
-            df_etf_comb = df_etf.join(df_cw, how='left')
-            df_etf_comb['Cash_Weight'] = df_etf_comb['Cash_Weight'].ffill().fillna(0)
             
-            dates = df_etf_comb.index
-            dt_all = pd.date_range(start=dates.min(), end=dates.max())
-            dt_breaks = [d.strftime("%Y-%m-%d") for d in dt_all if d not in dates]
+            # 【斷層修補機制】：確保 Yfinance 漏抓的開盤日依然能在畫面上呈現
+            combined_index = df_etf.index.union(df_cw.index).sort_values()
+            mask = combined_index >= df_etf.index.min()
+            combined_index = combined_index[mask]
+            
+            df_etf_patched = pd.DataFrame(index=combined_index).join(df_etf, how='left')
+            df_etf_patched['Close'] = df_etf_patched['Close'].ffill()
+            df_etf_patched['Open'] = df_etf_patched['Open'].fillna(df_etf_patched['Close'])
+            df_etf_patched['High'] = df_etf_patched['High'].fillna(df_etf_patched['Close'])
+            df_etf_patched['Low'] = df_etf_patched['Low'].fillna(df_etf_patched['Close'])
+            
+            df_etf_comb = df_etf_patched.join(df_cw, how='left')
+            df_etf_comb['Cash_Weight'] = df_etf_comb['Cash_Weight'].ffill().fillna(0)
+            df_etf_comb = df_etf_comb.dropna(subset=['Close'])
+            
+            # 恢復字串格式
+            str_dates = df_etf_comb.index.strftime('%Y-%m-%d')
 
             fig = make_subplots(
                 rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05,
@@ -395,19 +415,19 @@ if menu == "總覽 (Dashboard)":
             )
             
             fig.add_trace(go.Candlestick(
-                x=dates, open=df_etf_comb['Open'], high=df_etf_comb['High'],
+                x=str_dates, open=df_etf_comb['Open'], high=df_etf_comb['High'],
                 low=df_etf_comb['Low'], close=df_etf_comb['Close'], name='K線',
                 increasing_line_color='#EF5350', increasing_fillcolor='#EF5350',
                 decreasing_line_color='#26A69A', decreasing_fillcolor='#26A69A'
             ), row=1, col=1)
             
             fig.add_trace(go.Scatter(
-                x=dates, y=df_etf_comb['Cash_Weight'], mode='lines', 
+                x=str_dates, y=df_etf_comb['Cash_Weight'], mode='lines', 
                 line=dict(color='#2962FF', width=2), fill='tozeroy', fillcolor='rgba(41, 98, 255, 0.1)', name='現金權重'
             ), row=2, col=1)
 
             fig.update_layout(**tv_layout, height=500, xaxis_rangeslider_visible=False)
-            fig.update_xaxes(type='date', rangebreaks=[dict(values=dt_breaks)], nticks=10)
+            fig.update_xaxes(type='category', nticks=10) # 恢復 Category 隱藏假日
             st.plotly_chart(fig, use_container_width=True, key="dashboard_main_chart")
         else:
             st.warning("無法取得 00981A 資料。")
@@ -436,8 +456,6 @@ if menu == "總覽 (Dashboard)":
         
         with st.spinner("正在計算成本分析..."):
             price_map = get_bulk_prices(sids, start_d, datetime.now() + timedelta(days=1))
-            
-            # --- 極速優化核心：預先將歷史資料分組，避免迴圈內做重複的全表掃描 ---
             history_grouped = dict(tuple(df_history_cache.groupby('ID')))
             
             for row in df_latest.itertuples():
@@ -445,7 +463,6 @@ if menu == "總覽 (Dashboard)":
                 df_p = price_map.get(sid, pd.DataFrame())
 
                 if not df_p.empty:
-                    # 直接從 GroupBy 提取資料，並標記 is_grouped=True
                     df_stock_h = history_grouped.get(sid, pd.DataFrame())
                     _, cost_line, _, _ = calculate_avg_cost_optimized(df_stock_h, sid, df_p, is_grouped=True)
                     
