@@ -171,7 +171,6 @@ def get_all_holdings_history(_df_files):
     return pd.DataFrame()
 
 def fetch_finmind_price(sid, start_dt, end_dt):
-    """直接呼叫 FinMind 抓取台股真實資料，解決 yfinance 斷層問題"""
     sid_str = str(sid).replace('.TW', '').replace('.TWO', '').strip()
     url = "https://api.finmindtrade.com/api/v4/data"
     params = {
@@ -244,14 +243,12 @@ def get_bulk_prices(sids, start_dt, end_dt):
         elif cleaned_two is not None:
             combined = cleaned_two
             
-        # 啟動 FinMind 備援：針對 00981a 或 Yfinance 抓出大缺口的股票
         if combined is None or combined.empty or len(combined) < 20 or "00981" in str(sid):
             fm_df = fetch_finmind_price(sid, start_dt, end_dt)
             if not fm_df.empty:
                 if combined is None or combined.empty:
                     combined = fm_df
                 else:
-                    # 使用 FinMind 資料完美填補 yfinance 的缺口
                     combined = fm_df.combine_first(combined)
 
         if combined is not None and not combined.empty:
@@ -339,7 +336,6 @@ def draw_analysis_chart(sid, name, df_history, unique_key_prefix):
     dates, cost_line, shares_series, diff_series = calculate_avg_cost_optimized(df_history, sid, df_chart_price, is_grouped=False)
     amounts = diff_series * df_chart_price['Close'].values
     
-    # 強制將日期轉為字串格式，讓 Hover 完全恢復原本的顯示風格
     str_dates = df_chart_price.index.strftime('%Y-%m-%d')
 
     fig = make_subplots(
@@ -371,7 +367,7 @@ def draw_analysis_chart(sid, name, df_history, unique_key_prefix):
     ), row=3, col=1)
     
     fig.update_layout(**tv_layout, height=800, xaxis_rangeslider_visible=False)
-    fig.update_xaxes(type='category', nticks=10) # 搭配字串陣列，完美跳過假日
+    fig.update_xaxes(type='category', nticks=10)
     st.plotly_chart(fig, use_container_width=True, key=f"{unique_key_prefix}_chart_{sid}")
 
 @st.dialog("個股詳細分析", width="large")
@@ -395,7 +391,19 @@ df_history_cache = get_all_holdings_history(df_files)
 
 latest_date_record = df_files.iloc[-1]['date']
 latest_path = df_files.iloc[-1]['path']
+
+# =========================================================
+# 新增：側邊欄加入「強制同步」按鈕，解決快取未更新的問題
+# =========================================================
 st.sidebar.info(f"最新資料日期: {latest_date_record.strftime('%Y-%m-%d')}")
+
+if st.sidebar.button("🔄 強制同步最新資料", use_container_width=True):
+    # 清除所有裝飾了 @st.cache_data 的函式快取
+    sync_data_repo.clear()
+    get_all_holdings_history.clear()
+    get_bulk_prices.clear()
+    get_etf_cash_history.clear()
+    st.rerun() # 重新整理頁面以抓取最新資料
 
 menu = st.sidebar.radio("功能選單", ["總覽 (Dashboard)", "每日持倉變化"])
 
@@ -422,7 +430,6 @@ if menu == "總覽 (Dashboard)":
             df_etf_comb = df_etf.join(df_cw, how='left')
             df_etf_comb['Cash_Weight'] = df_etf_comb['Cash_Weight'].ffill().fillna(0)
             
-            # 確保乾淨無斷層的資料進入圖表，並轉為字串格式恢復 Hover
             str_dates = df_etf_comb.index.strftime('%Y-%m-%d')
 
             fig = make_subplots(
@@ -443,7 +450,7 @@ if menu == "總覽 (Dashboard)":
             ), row=2, col=1)
 
             fig.update_layout(**tv_layout, height=500, xaxis_rangeslider_visible=False)
-            fig.update_xaxes(type='category', nticks=10) # 恢復 Category 隱藏假日
+            fig.update_xaxes(type='category', nticks=10)
             st.plotly_chart(fig, use_container_width=True, key="dashboard_main_chart")
         else:
             st.warning("無法取得 00981A 資料。")
