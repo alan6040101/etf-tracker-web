@@ -381,7 +381,7 @@ def show_stock_dialog(sid, name, df_history):
 st.title("📊 00981a ETF 追蹤器")
 
 # =========================================================
-# 新增：網頁一載入 (F5 重整) 就自動清除 GitHub 快取
+# 網頁一載入 (F5 重整) 就自動清除 GitHub 快取
 # =========================================================
 if "page_loaded" not in st.session_state:
     sync_data_repo.clear()
@@ -599,8 +599,9 @@ elif menu == "每日持倉變化":
                 df_display = df_display.sort_values(by=['Is_Zero', 'Weight_num'], ascending=[True, False])
                 
                 st.subheader("📋 持股變化表")
+                # 修正 Pandas 更新造成的 AttributeError，將 applymap 改為 map
                 st.dataframe(
-                    df_display.drop(columns=['Weight_num', 'Is_Zero']).style.applymap(
+                    df_display.drop(columns=['Weight_num', 'Is_Zero']).style.map(
                         lambda v: 'color: #EF5350' if v > 0 else 'color: #26A69A' if v < 0 else '', 
                         subset=['股數變化']
                     ).format({'前股數': '{:,}', '今股數': '{:,}', '股數變化': '{:,}'}),
